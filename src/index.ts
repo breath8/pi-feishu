@@ -114,18 +114,20 @@ function loadConfig(): FeishuConfig {
 
 // ─── Chat 状态 ──────────────────────────────────────────
 
+interface ToolEntry {
+  name: string;
+  status: "running" | "done" | "error";
+  args?: string;
+  result?: string;
+}
+
 interface ChatState {
   chatId: string;
-  /** 用户原始消息 ID，用于 reply threading */
   userMsgId: string;
-
-  // ── 工具进度追踪 ──
-  /** 进度卡片消息 ID（所有工具共用一个可编辑卡片） */
   progressMsgId: string | null;
-  /** 卡片是否正在创建中（防止竞态重复创建） */
   progressCreating: boolean;
-  /** 工具执行记录 */
-  toolEntries: Array<{ name: string; status: "running" | "done" | "error" }>;
+  toolEntries: ToolEntry[];
+  pendingFinalText?: string;
 }
 
 // ─── 扩展入口 ───────────────────────────────────────────
@@ -480,7 +482,31 @@ export default function (pi: ExtensionAPI) {
     if (!state) return;
 
     const toolName = event.toolName as string;
-    state.toolEntries.push({ name: toolName, status: "running" });
+    const toolArgs = event.args as Record<string, unknown> | undefined;
+    
+    let argsStr = "";
+    if (toolArgs) {
+      if (toolName === "bash" && toolArgs.command) {
+        argsStr = String(toolArgs.command);
+      } else if (toolName === "read" && toolArgs.filePath) {
+        argsStr = String(toolArgs.filePath);
+      } else if (toolName === "write" && toolArgs.filePath) {
+        argsStr = String(toolArgs.filePath);
+      } else if (toolName === "edit" && toolArgs.filePath) {
+        argsStr = String(toolArgs.filePath);
+      } else if (toolName === "grep" && toolArgs.pattern) {
+        argsStr = String(toolArgs.pattern);
+      } else if (toolName === "glob" && toolArgs.pattern) {
+        argsStr = String(toolArgs.pattern);
+      } else {
+        const firstValue = Object.values(toolArgs)[0];
+        if (firstValue !== undefined) {
+          argsStr = String(firstValue).substring(0, 100);
+        }
+      }
+    }
+
+    state.toolEntries.push({ name: toolName, status: "running", args: argsStr });
 
     updateProgressCard(state);
     flashStatus(`飞书: 🔧 ${toolDisplayName(toolName)}...`);
@@ -495,11 +521,30 @@ export default function (pi: ExtensionAPI) {
 
     const toolName = event.toolName as string;
     const isError = event.isError as boolean;
+    const toolResult = event.result;
 
-    // 找到对应的 running 条目并更新状态
     for (let i = state.toolEntries.length - 1; i >= 0; i--) {
       if (state.toolEntries[i].name === toolName && state.toolEntries[i].status === "running") {
         state.toolEntries[i].status = isError ? "error" : "done";
+        
+        if (toolResult !== undefined && toolResult !== null) {
+          let resultStr: string;
+          
+          if (typeof toolResult === "string") {
+            try {
+              const parsed = JSON.parse(toolResult);
+              resultStr = extractReadableText(parsed);
+            } catch {
+              resultStr = toolResult;
+            }
+          } else if (typeof toolResult === "object") {
+            resultStr = extractReadableText(toolResult);
+          } else {
+            resultStr = String(toolResult);
+          }
+          
+          state.toolEntries[i].result = resultStr.substring(0, 500);
+        }
         break;
       }
     }
@@ -517,7 +562,6 @@ export default function (pi: ExtensionAPI) {
     const message = event.message;
     if (!message || message.role !== "assistant") return;
 
-    // ── 检测 LLM 错误 ──
     if (message.stopReason === "error") {
       const errMsg = message.errorMessage ?? "LLM 返回了未知错误";
       client.sendMessage(state.chatId, `LLM 错误: ${errMsg}`, state.userMsgId).catch(() => {});
@@ -529,24 +573,16 @@ export default function (pi: ExtensionAPI) {
     const textContent = extractTextFromMessage(message);
     if (!textContent) return;
 
-    // 标题降级
-    const processed = downgradeHeadings(textContent);
-
-    // 检查这一轮是否包含工具调用
     const hasToolCalls = message.content?.some((block: any) => block.type === "toolCall");
 
     if (hasToolCalls) {
-      // 中间轮：assistant 有文本 + 工具调用 → 发送中间文本（回复到用户消息）
+      const processed = downgradeHeadings(textContent);
       const chunks = chunkText(processed, MAX_TEXT_CHUNK);
       for (const chunk of chunks) {
-        client.sendMessage(state.chatId, chunk, state.userMsgId);
+        client.sendMessage(state.chatId, chunk, state.userMsgId).catch(() => {});
       }
     } else {
-      // 最终轮（或无工具调用的单轮）→ 发送文本（新消息）
-      const chunks = chunkText(processed, MAX_TEXT_CHUNK);
-      for (const chunk of chunks) {
-        client.sendMessage(state.chatId, chunk);
-      }
+      state.pendingFinalText = (state.pendingFinalText || "") + textContent;
     }
 
     flashStatus(`飞书: 📤 推送中 (${textContent.length}字)`);
@@ -554,20 +590,48 @@ export default function (pi: ExtensionAPI) {
 
   // ─── agent_end → 清理 + 处理下一条排队消息 ──────────
 
-  pi.on("agent_end", (_event: AgentEndEvent) => {
+  pi.on("agent_end", (event: AgentEndEvent) => {
     if (!client || client.getStatus() !== "connected") return;
     const state = findActiveState();
     if (!state) return;
 
     const chatId = state.chatId;
 
-    // 移除 Typing Reaction
+    const pending = state.pendingFinalText || "";
+    const allAssistantTexts: string[] = [];
+
+    if (pending) {
+      allAssistantTexts.push(pending);
+    }
+
+    if (event.messages?.length) {
+      for (const msg of event.messages) {
+        if (msg.role === "assistant") {
+          const text = extractTextFromMessage(msg);
+          if (text) allAssistantTexts.push(text);
+        }
+      }
+    }
+
+    const finalText = allAssistantTexts.join("\n");
+
+    if (finalText) {
+      const processed = downgradeHeadings(finalText);
+      const chunks = chunkText(processed, MAX_TEXT_CHUNK);
+      for (const chunk of chunks) {
+        client.sendMessage(chatId, chunk).catch(() => {});
+      }
+    }
+
+    state.toolEntries.forEach((e) => {
+      if (e.status === "running") e.status = "done";
+    });
+    updateProgressCard(state);
+
     client.stopTyping(chatId, true).catch(() => {});
 
-    // 清理当前状态
     chatStates.delete(chatId);
 
-    // 刷新所有队列（包括当前聊天）
     const queue = chatQueues.get(chatId);
     if (queue) queue.processing = false;
     flushAllQueues();
@@ -607,33 +671,54 @@ export default function (pi: ExtensionAPI) {
    * 构建工具进度卡片内容。
    * 所有工具共用一条可编辑消息，只滚动保留最近 10 次操作。
    */
-  function buildProgressCardContent(entries: ChatState["toolEntries"]): string {
-    const MAX_DISPLAY = 10;
+  function buildProgressCardContent(entries: ToolEntry[]): string {
+    const MAX_DISPLAY = 5;
     const total = entries.length;
     const display = total > MAX_DISPLAY ? entries.slice(-MAX_DISPLAY) : entries;
 
     const lines: string[] = [];
 
-    // 如果有截断，显示省略提示
     if (total > MAX_DISPLAY) {
       lines.push(`... 前 ${total - MAX_DISPLAY} 次操作已折叠\n`);
     }
 
     for (const entry of display) {
       const displayName = toolDisplayName(entry.name);
+      
       switch (entry.status) {
         case "running":
-          lines.push(`⏳ **${displayName}** ...`);
+          lines.push(`⏳ **${displayName}**`);
+          if (entry.args) {
+            lines.push(`\`${entry.args}\``);
+          }
           break;
         case "done":
-          lines.push(`✅ ~~${displayName}~~`);
+          lines.push(`✅ **${displayName}**`);
+          if (entry.args) {
+            lines.push(`\`${entry.args}\``);
+          }
+          if (entry.result) {
+            const preview = entry.result.length > 100 
+              ? entry.result.substring(0, 100) + "..." 
+              : entry.result;
+            lines.push(`\`\`\`\n${preview}\n\`\`\``);
+          }
           break;
         case "error":
           lines.push(`❌ **${displayName}**`);
+          if (entry.args) {
+            lines.push(`\`${entry.args}\``);
+          }
+          if (entry.result) {
+            lines.push(`错误: ${entry.result}`);
+          }
           break;
       }
+      lines.push("");
     }
-    return lines.join("\n");
+    
+    const content = lines.join("\n");
+    return content.trim() || "处理中...";
   }
 
   /** 创建或更新进度卡片（防竞态：全生命周期只创建一条消息） */
@@ -959,18 +1044,42 @@ export default function (pi: ExtensionAPI) {
 
   // ─── 工具函数 ────────────────────────────────────────
 
-  /**
-   * Markdown 标题降级：所有出站文本的标题层级 +2，最小 H6。
-   * 规则：只处理行首 # 开头、不在代码块内的标题行。
-   *   H1 → H3, H2 → H4, H3 → H5, H4 → H6, H5/H6 → H6
-   */
+  function extractReadableText(obj: any, depth = 0): string {
+    if (depth > 10) return "[nested too deep]";
+    if (obj === null || obj === undefined) return "";
+    
+    if (typeof obj === "string") return obj;
+    if (typeof obj === "number" || typeof obj === "boolean") return String(obj);
+    
+    if (Array.isArray(obj)) {
+      const items = obj.map(item => extractReadableText(item, depth + 1)).filter(t => t);
+      return items.join("\n");
+    }
+    
+    if (typeof obj === "object") {
+      if (obj.text) return String(obj.text);
+      if (obj.content) return extractReadableText(obj.content, depth + 1);
+      if (obj.output) return String(obj.output);
+      if (obj.message) return String(obj.message);
+      if (obj.error) return String(obj.error);
+      if (obj.result) return extractReadableText(obj.result, depth + 1);
+      if (obj.data) return extractReadableText(obj.data, depth + 1);
+      
+      const values = Object.values(obj).map(v => extractReadableText(v, depth + 1)).filter(t => t);
+      if (values.length > 0) return values.join("\n");
+      
+      return JSON.stringify(obj, null, 2);
+    }
+    
+    return String(obj);
+  }
+
   function downgradeHeadings(text: string): string {
     const lines = text.split("\n");
     const result: string[] = [];
     let inCodeBlock = false;
 
     for (const line of lines) {
-      // 追踪代码块状态
       if (line.startsWith("```")) {
         inCodeBlock = !inCodeBlock;
         result.push(line);
@@ -982,12 +1091,10 @@ export default function (pi: ExtensionAPI) {
         continue;
       }
 
-      // 匹配行首标题：1-6 个 # 后跟空格或行尾
-      const match = line.match(/^(#{1,6})\s/);
+      const match = line.match(/^(#{1,6})\s(.+)/);
       if (match) {
-        const level = match[1].length;
-        const newLevel = Math.min(level + 2, 6);
-        result.push("#".repeat(newLevel) + line.slice(level));
+        const headingText = match[2].trim();
+        result.push(`**${headingText}**`);
       } else {
         result.push(line);
       }
@@ -996,13 +1103,15 @@ export default function (pi: ExtensionAPI) {
     return result.join("\n");
   }
 
-  /** 从 Pi 消息中提取文本内容 */
   function extractTextFromMessage(message: any): string | null {
     if (!message?.content) return null;
     const parts: string[] = [];
     for (const block of message.content) {
       if (block.type === "text" && block.text) {
-        parts.push(block.text);
+        const trimmed = block.text.trim();
+        if (trimmed) {
+          parts.push(trimmed);
+        }
       }
     }
     return parts.length > 0 ? parts.join("\n") : null;
