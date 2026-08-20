@@ -127,7 +127,6 @@ interface ChatState {
   progressMsgId: string | null;
   progressCreating: boolean;
   toolEntries: ToolEntry[];
-  pendingFinalText?: string;
 }
 
 // ─── 扩展入口 ───────────────────────────────────────────
@@ -581,8 +580,6 @@ export default function (pi: ExtensionAPI) {
       for (const chunk of chunks) {
         client.sendMessage(state.chatId, chunk, state.userMsgId).catch(() => {});
       }
-    } else {
-      state.pendingFinalText = (state.pendingFinalText || "") + textContent;
     }
 
     flashStatus(`飞书: 📤 推送中 (${textContent.length}字)`);
@@ -597,12 +594,7 @@ export default function (pi: ExtensionAPI) {
 
     const chatId = state.chatId;
 
-    const pending = state.pendingFinalText || "";
     const allAssistantTexts: string[] = [];
-
-    if (pending) {
-      allAssistantTexts.push(pending);
-    }
 
     if (event.messages?.length) {
       for (const msg of event.messages) {
