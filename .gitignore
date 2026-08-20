@@ -14,3 +14,7 @@ reference/
 
 # Development docs (not part of the package)
 docs/
+
+# Tool directories
+.firecrawl/
+.sisyphus/
