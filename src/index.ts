@@ -620,7 +620,9 @@ export default function (pi: ExtensionAPI) {
     state.toolEntries.forEach((e) => {
       if (e.status === "running") e.status = "done";
     });
-    updateProgressCard(state);
+    if (state.toolEntries.length > 0) {
+      updateProgressCard(state);
+    }
 
     client.stopTyping(chatId, true).catch(() => {});
 
