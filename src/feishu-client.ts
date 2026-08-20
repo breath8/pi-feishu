@@ -247,33 +247,39 @@ export class FeishuClient {
 
   /** 发送文本消息到飞书（回复模式优先，使用 interactive 卡片格式） */
   async sendMessage(chatId: string, text: string, replyToMsgId?: string): Promise<void> {
-    const card = FeishuClient.buildTextCard(text);
-    const content = JSON.stringify(card);
+    const cards = FeishuClient.buildTextCardsWithTable(text);
 
-    try {
-      if (replyToMsgId) {
-        await this.client.im.message.reply({
-          path: { message_id: replyToMsgId },
-          data: { content, msg_type: "interactive" },
-        });
-      } else {
-        await this.client.im.message.create({
-          params: { receive_id_type: "chat_id" },
-          data: { receive_id: chatId, content, msg_type: "interactive" },
-        });
-      }
-      _log(`Message sent to ${chatId}${replyToMsgId ? ` (reply to ${replyToMsgId})` : ""}`);
-    } catch (err: any) {
-      if (replyToMsgId && (err?.code === 230011 || err?.code === 231003)) {
-        _warn("Reply failed (message withdrawn), falling back to create");
-        await this.client.im.message.create({
-          params: { receive_id_type: "chat_id" },
-          data: { receive_id: chatId, content, msg_type: "interactive" },
-        });
-      } else {
-        throw err;
+    for (let i = 0; i < cards.length; i++) {
+      const card = cards[i];
+      const isFirst = i === 0;
+      const content = JSON.stringify(card);
+
+      try {
+        if (isFirst && replyToMsgId) {
+          await this.client.im.message.reply({
+            path: { message_id: replyToMsgId },
+            data: { content, msg_type: "interactive" },
+          });
+        } else {
+          await this.client.im.message.create({
+            params: { receive_id_type: "chat_id" },
+            data: { receive_id: chatId, content, msg_type: "interactive" },
+          });
+        }
+      } catch (err: any) {
+        if (isFirst && replyToMsgId && (err?.code === 230011 || err?.code === 231003)) {
+          _warn("Reply failed (message withdrawn), falling back to create");
+          await this.client.im.message.create({
+            params: { receive_id_type: "chat_id" },
+            data: { receive_id: chatId, content, msg_type: "interactive" },
+          });
+        } else {
+          throw err;
+        }
       }
     }
+
+    _log(`Message sent to ${chatId}${replyToMsgId ? ` (reply to ${replyToMsgId})` : ""} (${cards.length} cards)`);
   }
 
   /** 发送交互卡片消息 */
@@ -659,27 +665,203 @@ export class FeishuClient {
 
   // ─── 交互卡片构建 ──────────────────────────────────────
 
-  /** v2 卡片外壳 */
-  private static v2Card(elements: Record<string, unknown>[]): Record<string, unknown> {
-    return {
-      schema: "2.0",
-      body: { elements },
-    };
-  }
-
   /** 截断过长文本 */
   private static safeText(text: string, limit = 3500): string {
     return text.length > limit ? text.substring(0, limit) + "\n..." : text;
   }
 
+  /**
+   * 构建飞书交互卡片（v1 格式）。
+   *
+   * 注意：飞书 Bot 消息 API (im.message.create) 的 interactive 类型
+   * 期望 v1 卡片格式（elements 在顶层 + config.wide_screen_mode），
+   * 而不是 v2 格式（schema: "2.0" + body 包装层）。
+   * 使用 v2 格式会导致卡片渲染为空白。
+   */
+  private static buildCard(elements: Record<string, unknown>[]): Record<string, unknown> {
+    return {
+      schema: "2.0",
+      body: {
+        elements,
+      },
+    };
+  }
+
   /** 构建纯文本卡片（用于普通消息回复，支持完整 Markdown） */
   static buildTextCard(text: string): Record<string, unknown> {
-    return FeishuClient.v2Card([
+    return FeishuClient.buildCard([
       { tag: "markdown", content: FeishuClient.safeText(text) },
     ]);
   }
 
-  /** 构建流式更新卡片（状态行 + 内容，支持完整 Markdown） */
+  static buildTextCardsWithTable(text: string): Record<string, unknown>[] {
+    const hasTable = FeishuClient.detectMarkdownTable(text);
+    
+    if (!hasTable) {
+      return [FeishuClient.buildTextCard(text)];
+    }
+
+    const MAX_TABLES_PER_CARD = 5;
+    const parts = FeishuClient.splitTextAndTables(text);
+    const cards: Record<string, unknown>[] = [];
+    let currentElements: Record<string, unknown>[] = [];
+    let tableCount = 0;
+
+    for (const part of parts) {
+      if (part.type === "text" && part.content.trim()) {
+        currentElements.push({ tag: "markdown", content: part.content.trim() });
+      } else if (part.type === "table") {
+        if (tableCount >= MAX_TABLES_PER_CARD) {
+          if (currentElements.length > 0) {
+            cards.push(FeishuClient.buildCard(currentElements));
+          }
+          currentElements = [];
+          tableCount = 0;
+        }
+        const table = FeishuClient.buildFeishuTable(part.content);
+        if (table) {
+          currentElements.push(table);
+          tableCount++;
+        } else {
+          currentElements.push({ tag: "markdown", content: part.content });
+        }
+      }
+    }
+
+    if (currentElements.length > 0) {
+      cards.push(FeishuClient.buildCard(currentElements));
+    }
+
+    if (cards.length === 0) {
+      cards.push(FeishuClient.buildCard([{ tag: "markdown", content: "处理中..." }]));
+    }
+
+    return cards;
+  }
+
+  private static detectMarkdownTable(text: string): boolean {
+    const lines = text.split("\n");
+    for (const line of lines) {
+      if (line.includes("|") && line.trim().startsWith("|")) {
+        const cells = line.split("|").filter(c => c.trim() !== "");
+        if (cells.length >= 2) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  private static splitTextAndTables(text: string): Array<{ type: "text" | "table"; content: string }> {
+    const parts: Array<{ type: "text" | "table"; content: string }> = [];
+    const lines = text.split("\n");
+    let currentText: string[] = [];
+    let tableLines: string[] = [];
+    let inTable = false;
+
+    for (const line of lines) {
+      const isTableLine = line.includes("|") && line.trim().startsWith("|");
+
+      if (isTableLine) {
+        if (!inTable) {
+          if (currentText.length > 0) {
+            parts.push({ type: "text", content: currentText.join("\n") });
+            currentText = [];
+          }
+          inTable = true;
+        }
+        tableLines.push(line);
+      } else {
+        if (inTable) {
+          if (tableLines.length > 0) {
+            parts.push({ type: "table", content: tableLines.join("\n") });
+            tableLines = [];
+          }
+          inTable = false;
+        }
+        currentText.push(line);
+      }
+    }
+
+    if (inTable && tableLines.length > 0) {
+      parts.push({ type: "table", content: tableLines.join("\n") });
+    } else if (currentText.length > 0) {
+      parts.push({ type: "text", content: currentText.join("\n") });
+    }
+
+    return parts;
+  }
+
+  private static buildFeishuTable(text: string): Record<string, unknown> | null {
+    const table = FeishuClient.parseMarkdownTable(text);
+    if (!table) return null;
+
+    const columns = table.headers.map((header, index) => ({
+      name: `col_${index}`,
+      display_name: header,
+      data_type: "text" as const,
+    }));
+
+    const cleanCellText = (text: string): string => {
+      return text
+        .replace(/\*\*\*(.+?)\*\*\*/g, "$1")
+        .replace(/\*\*(.+?)\*\*/g, "$1")
+        .replace(/\*(.+?)\*/g, "$1")
+        .replace(/`(.+?)`/g, "$1")
+        .replace(/\[(.+?)\]\(.+?\)/g, "$1")
+        .trim();
+    };
+
+    const rows = table.rows.map(row => {
+      const rowData: Record<string, string> = {};
+      table.headers.forEach((_, index) => {
+        rowData[`col_${index}`] = cleanCellText(row[index] || "");
+      });
+      return rowData;
+    });
+
+    return {
+      tag: "table",
+      page_size: Math.min(rows.length, 10),
+      columns,
+      rows,
+    };
+  }
+
+  private static parseMarkdownTable(text: string): { headers: string[]; rows: string[][] } | null {
+    const lines = text.split("\n");
+    const headers: string[] = [];
+    const rows: string[][] = [];
+    let headerFound = false;
+    let separatorFound = false;
+
+    for (const line of lines) {
+      if (!line.includes("|") || !line.trim().startsWith("|")) {
+        if (headerFound && separatorFound) {
+          break;
+        }
+        continue;
+      }
+
+      const cells = line.split("|").filter(c => c.trim() !== "").map(c => c.trim());
+
+      if (!headerFound) {
+        headers.push(...cells);
+        headerFound = true;
+      } else if (!separatorFound && cells.every(c => c.match(/^[-:]+$/))) {
+        separatorFound = true;
+      } else if (headerFound && separatorFound) {
+        rows.push(cells);
+      }
+    }
+
+    if (headers.length === 0 || rows.length === 0) {
+      return null;
+    }
+
+    return { headers, rows };
+  }
+
   static buildStreamingCard(text: string, status?: string): Record<string, unknown> {
     const elements: Record<string, unknown>[] = [];
 
@@ -689,12 +871,12 @@ export class FeishuClient {
 
     elements.push({ tag: "markdown", content: FeishuClient.safeText(text) });
 
-    return FeishuClient.v2Card(elements);
+    return FeishuClient.buildCard(elements);
   }
 
   /** 构建完成态卡片（支持完整 Markdown） */
   static buildFinalCard(text: string): Record<string, unknown> {
-    return FeishuClient.v2Card([
+    return FeishuClient.buildCard([
       { tag: "markdown", content: FeishuClient.safeText(text) },
     ]);
   }
