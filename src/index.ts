@@ -115,6 +115,7 @@ function loadConfig(): FeishuConfig {
 // ─── Chat 状态 ──────────────────────────────────────────
 
 interface ToolEntry {
+  id: string;
   name: string;
   status: "running" | "done" | "error";
   args?: string;
@@ -505,7 +506,7 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    state.toolEntries.push({ name: toolName, status: "running", args: argsStr });
+    state.toolEntries.push({ id: event.toolCallId as string, name: toolName, status: "running", args: argsStr });
 
     updateProgressCard(state);
     flashStatus(`飞书: 🔧 ${toolDisplayName(toolName)}...`);
@@ -518,12 +519,13 @@ export default function (pi: ExtensionAPI) {
     const state = findActiveState();
     if (!state) return;
 
+    const toolCallId = event.toolCallId as string;
     const toolName = event.toolName as string;
     const isError = event.isError as boolean;
     const toolResult = event.result;
 
     for (let i = state.toolEntries.length - 1; i >= 0; i--) {
-      if (state.toolEntries[i].name === toolName && state.toolEntries[i].status === "running") {
+      if (state.toolEntries[i].id === toolCallId) {
         state.toolEntries[i].status = isError ? "error" : "done";
         
         if (toolResult !== undefined && toolResult !== null) {
