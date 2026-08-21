@@ -128,6 +128,7 @@ interface ChatState {
   progressMsgId: string | null;
   progressCreating: boolean;
   toolEntries: ToolEntry[];
+  generation: number;
 }
 
 // ─── 扩展入口 ───────────────────────────────────────────
@@ -156,6 +157,9 @@ export default function (pi: ExtensionAPI) {
 
   /** 每个聊天的消息队列 */
   const chatQueues: Map<string, ChatQueue> = new Map();
+
+  /** 每个聊天的当前处理 generation，用于过滤过期事件 */
+  const chatGeneration: Map<string, number> = new Map();
 
   // ─── 注册 CLI 标志 ────────────────────────────────────
 
@@ -311,12 +315,15 @@ export default function (pi: ExtensionAPI) {
     }
 
     // 初始化聊天状态
+    const gen = (chatGeneration.get(chatId) ?? 0) + 1;
+    chatGeneration.set(chatId, gen);
     chatStates.set(chatId, {
       chatId,
       userMsgId: item.msgId,
       progressMsgId: null,
       progressCreating: false,
       toolEntries: [],
+      generation: gen,
     });
 
     // 添加 Typing Reaction
@@ -351,6 +358,7 @@ export default function (pi: ExtensionAPI) {
         if (state) {
           client?.stopTyping(chatId, false).catch(() => {});
           chatStates.delete(chatId);
+          chatGeneration.set(chatId, (chatGeneration.get(chatId) ?? 0) + 1);
         }
         if (queue) {
           queue.queue = [];
@@ -381,6 +389,7 @@ export default function (pi: ExtensionAPI) {
         if (state) {
           client?.stopTyping(chatId, false).catch(() => {});
           chatStates.delete(chatId);
+          chatGeneration.set(chatId, (chatGeneration.get(chatId) ?? 0) + 1);
         }
         if (queue) {
           queue.queue = [];
@@ -560,6 +569,11 @@ export default function (pi: ExtensionAPI) {
     const state = findActiveState();
     if (!state) return;
 
+    if (state.generation !== chatGeneration.get(state.chatId)) return;
+
+    const queue = chatQueues.get(state.chatId);
+    if (!queue || !queue.processing) return;
+
     const message = event.message;
     if (!message || message.role !== "assistant") return;
 
@@ -568,6 +582,14 @@ export default function (pi: ExtensionAPI) {
       client.sendMessage(state.chatId, `LLM 错误: ${errMsg}`, state.userMsgId).catch(() => {});
       client.stopTyping(state.chatId, false).catch(() => {});
       flashStatus("飞书: ⚠️ LLM 错误");
+      
+      // 清理状态，确保与 agent_end 流程一致
+      chatStates.delete(state.chatId);
+      chatGeneration.set(state.chatId, (chatGeneration.get(state.chatId) ?? 0) + 1);
+      const cleanupQueue = chatQueues.get(state.chatId);
+      if (cleanupQueue) cleanupQueue.processing = false;
+      flushAllQueues();
+      
       return;
     }
 
@@ -593,6 +615,11 @@ export default function (pi: ExtensionAPI) {
     if (!client || client.getStatus() !== "connected") return;
     const state = findActiveState();
     if (!state) return;
+
+    if (state.generation !== chatGeneration.get(state.chatId)) return;
+
+    const targetQueue = chatQueues.get(state.chatId);
+    if (!targetQueue || !targetQueue.processing) return;
 
     const chatId = state.chatId;
 
@@ -628,8 +655,8 @@ export default function (pi: ExtensionAPI) {
 
     chatStates.delete(chatId);
 
-    const queue = chatQueues.get(chatId);
-    if (queue) queue.processing = false;
+    const currentQueue = chatQueues.get(chatId);
+    if (currentQueue) currentQueue.processing = false;
     flushAllQueues();
     flashStatus("飞书: ✅ 完成");
   });
@@ -1036,6 +1063,7 @@ export default function (pi: ExtensionAPI) {
       client = null;
     }
     chatStates.clear();
+    chatGeneration.clear();
   });
 
   // ─── 工具函数 ────────────────────────────────────────
