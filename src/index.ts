@@ -161,6 +161,9 @@ export default function (pi: ExtensionAPI) {
   /** 每个聊天的当前处理 generation，用于过滤过期事件 */
   const chatGeneration: Map<string, number> = new Map();
 
+  /** 进度卡片更新防抖定时器 */
+  const progressUpdateTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
+
   // ─── 注册 CLI 标志 ────────────────────────────────────
 
   pi.registerFlag("feishu-app-id", {
@@ -744,8 +747,22 @@ export default function (pi: ExtensionAPI) {
     return content.trim() || "处理中...";
   }
 
-  /** 创建或更新进度卡片（防竞态：全生命周期只创建一条消息） */
+  /** 创建或更新进度卡片（防抖：避免触发飞书 API 频率限制） */
   function updateProgressCard(state: ChatState): void {
+    if (!client) return;
+
+    const chatId = state.chatId;
+
+    const existing = progressUpdateTimers.get(chatId);
+    if (existing) clearTimeout(existing);
+
+    progressUpdateTimers.set(chatId, setTimeout(() => {
+      progressUpdateTimers.delete(chatId);
+      doUpdateProgressCard(state);
+    }, 300));
+  }
+
+  function doUpdateProgressCard(state: ChatState): void {
     if (!client) return;
 
     const content = buildProgressCardContent(state.toolEntries);
@@ -1064,6 +1081,8 @@ export default function (pi: ExtensionAPI) {
     }
     chatStates.clear();
     chatGeneration.clear();
+    for (const timer of progressUpdateTimers.values()) clearTimeout(timer);
+    progressUpdateTimers.clear();
   });
 
   // ─── 工具函数 ────────────────────────────────────────
