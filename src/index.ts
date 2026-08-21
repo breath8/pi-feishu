@@ -622,21 +622,9 @@ export default function (pi: ExtensionAPI) {
     if (message.stopReason === "error") {
       const errMsg = message.errorMessage ?? "LLM 返回了未知错误";
       client.sendMessage(state.chatId, `LLM 错误: ${errMsg}`, state.userMsgId).catch(() => {});
-      client.stopTyping(state.chatId, false).catch(() => {});
       flashStatus("飞书: ⚠️ LLM 错误");
       
-      // 清理状态，确保与 agent_end 流程一致
-      const watchdog = taskWatchdogTimers.get(state.chatId);
-      if (watchdog) {
-        clearTimeout(watchdog);
-        taskWatchdogTimers.delete(state.chatId);
-      }
-      chatStates.delete(state.chatId);
-      chatGeneration.set(state.chatId, (chatGeneration.get(state.chatId) ?? 0) + 1);
-      const cleanupQueue = chatQueues.get(state.chatId);
-      if (cleanupQueue) cleanupQueue.processing = false;
-      flushAllQueues();
-      
+      // 不清理状态：Pi 可能仍在继续处理，等 agent_end 完成清理
       return;
     }
 
