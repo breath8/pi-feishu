@@ -144,19 +144,22 @@ export default function (pi: ExtensionAPI) {
   // ─── 消息队列 ──────────────────────────────────────────
 
   interface QueuedMessage {
+    chatId: string;
     msgId: string;
     text: string;
     resources: InboundResource[];
     chatType: "p2p" | "group";
   }
 
-  interface ChatQueue {
-    processing: boolean;
-    queue: QueuedMessage[];
-  }
-
-  /** 每个聊天的消息队列 */
-  const chatQueues: Map<string, ChatQueue> = new Map();
+  /**
+   * 全局单队列：所有聊天串行处理。
+   * Pi 是单一会话，多聊天并发注入会导致上下文污染和事件错配，
+   * 因此所有聊天共享一个队列，同一时间只处理一条消息。
+   */
+  const globalQueue: { processing: boolean; items: QueuedMessage[] } = {
+    processing: false,
+    items: [],
+  };
 
   /** 每个聊天的当前处理 generation，用于过滤过期事件 */
   const chatGeneration: Map<string, number> = new Map();
@@ -172,8 +175,15 @@ export default function (pi: ExtensionAPI) {
     const existing = taskWatchdogTimers.get(chatId);
     if (existing) clearTimeout(existing);
 
-    taskWatchdogTimers.set(chatId, setTimeout(() => {
+    const timer = setTimeout(() => {
       taskWatchdogTimers.delete(chatId);
+
+      // Pi 仍在工作（长工具执行/长文本生成）→ 顺延看门狗，避免误杀活跃任务
+      if (ctxRef && !ctxRef.isIdle()) {
+        resetTaskWatchdog(chatId);
+        return;
+      }
+
       const state = chatStates.get(chatId);
       if (!state) return;
 
@@ -181,11 +191,12 @@ export default function (pi: ExtensionAPI) {
       client?.stopTyping(chatId, false).catch(() => {});
       chatStates.delete(chatId);
       chatGeneration.set(chatId, (chatGeneration.get(chatId) ?? 0) + 1);
-      const queue = chatQueues.get(chatId);
-      if (queue) queue.processing = false;
+      globalQueue.processing = false;
       flushAllQueues();
       flashStatus("飞书: ⏰ 任务超时");
-    }, TASK_WATCHDOG_MS));
+    }, TASK_WATCHDOG_MS);
+    if (timer.unref) timer.unref();
+    taskWatchdogTimers.set(chatId, timer);
   }
 
   // ─── 注册 CLI 标志 ────────────────────────────────────
@@ -282,14 +293,11 @@ export default function (pi: ExtensionAPI) {
     }
 
     // ── 入队 ──
-    const queue = chatQueues.get(chatId) ?? { processing: false, queue: [] };
-    chatQueues.set(chatId, queue);
+    globalQueue.items.push({ chatId, msgId, text: content, resources, chatType });
 
-    queue.queue.push({ msgId, text: content, resources, chatType });
-
-    if (queue.processing) {
+    if (globalQueue.processing) {
       // 当前正在处理 → 通知排队
-      const pos = queue.queue.length;
+      const pos = globalQueue.items.length;
       await client?.sendMessage(
         chatId,
         `已排队 (前面还有 ${pos - 1} 条)`,
@@ -300,26 +308,25 @@ export default function (pi: ExtensionAPI) {
     }
 
     // 当前空闲 → 开始处理
-    await dequeueAndProcess(chatId);
+    await dequeueAndProcess();
   }
 
-  /** 从队列取出下一条消息并开始处理 */
-  async function dequeueAndProcess(chatId: string): Promise<void> {
-    const queue = chatQueues.get(chatId);
-    if (!queue || queue.queue.length === 0) {
-      // 队列空，标记空闲
-      if (queue) queue.processing = false;
+  /** 从全局队列取出下一条消息并开始处理 */
+  async function dequeueAndProcess(): Promise<void> {
+    if (globalQueue.items.length === 0) {
+      globalQueue.processing = false;
       return;
     }
 
     // Pi 正忙（压缩中/流式中）→ 不出队，保持 processing=false 等空闲时再触发
     if (ctxRef && !ctxRef.isIdle()) {
-      queue.processing = false;
+      globalQueue.processing = false;
       return;
     }
 
-    queue.processing = true;
-    const item = queue.queue.shift()!;
+    globalQueue.processing = true;
+    const item = globalQueue.items.shift()!;
+    const chatId = item.chatId;
 
     flashStatus(`飞书: 📩 ${item.text.substring(0, 20)}${item.text.length > 20 ? "..." : ""}`);
 
@@ -379,9 +386,8 @@ export default function (pi: ExtensionAPI) {
 
     switch (cmd) {
       case "/new": {
-        // 清空飞书侧状态
+        // 清空飞书侧状态（Pi 会话全局共享，/new 影响所有聊天的排队任务）
         const state = chatStates.get(chatId);
-        const queue = chatQueues.get(chatId);
 
         if (state) {
           client?.stopTyping(chatId, false).catch(() => {});
@@ -393,10 +399,8 @@ export default function (pi: ExtensionAPI) {
             taskWatchdogTimers.delete(chatId);
           }
         }
-        if (queue) {
-          queue.queue = [];
-          queue.processing = false;
-        }
+        globalQueue.items = [];
+        globalQueue.processing = false;
 
         // 中断当前处理
         if (ctxRef && !ctxRef.isIdle()) {
@@ -416,8 +420,7 @@ export default function (pi: ExtensionAPI) {
       case "/stop": {
         // 中断当前处理 + 清空队列
         const state = chatStates.get(chatId);
-        const queue = chatQueues.get(chatId);
-        const clearedCount = queue?.queue.length ?? 0;
+        const clearedCount = globalQueue.items.length;
 
         if (state) {
           client?.stopTyping(chatId, false).catch(() => {});
@@ -429,10 +432,8 @@ export default function (pi: ExtensionAPI) {
             taskWatchdogTimers.delete(chatId);
           }
         }
-        if (queue) {
-          queue.queue = [];
-          queue.processing = false;
-        }
+        globalQueue.items = [];
+        globalQueue.processing = false;
 
         if (ctxRef && !ctxRef.isIdle()) {
           ctxRef.abort();
@@ -446,9 +447,8 @@ export default function (pi: ExtensionAPI) {
       }
 
       case "/queue": {
-        const queue = chatQueues.get(chatId);
         const state = chatStates.get(chatId);
-        const count = queue?.queue.length ?? 0;
+        const count = globalQueue.items.length;
         const idle = ctxRef?.isIdle() ?? true;
 
         if (!state && count === 0) {
@@ -476,13 +476,12 @@ export default function (pi: ExtensionAPI) {
       case "/status": {
         const status = client?.getStatus() ?? "未启动";
         const ctxUsage = ctxRef?.getContextUsage();
-        const queue = chatQueues.get(chatId);
         let reply = `Pi 状态:\n- 飞书连接: ${status}\n- App ID: ${config.appId ? "****" + config.appId.slice(-4) : "未设置"}`;
         if (ctxUsage && ctxUsage.tokens !== null) {
           reply += `\n- 上下文: ${ctxUsage.tokens}/${ctxUsage.contextWindow} tokens (${ctxUsage.percent ?? "?"}%)`;
         }
-        if (queue && queue.queue.length > 0) {
-          reply += `\n- 排队: ${queue.queue.length} 条`;
+        if (globalQueue.items.length > 0) {
+          reply += `\n- 排队: ${globalQueue.items.length} 条`;
         }
         await client?.sendMessage(chatId, reply, msgId);
         break;
@@ -613,8 +612,7 @@ export default function (pi: ExtensionAPI) {
 
     if (state.generation !== chatGeneration.get(state.chatId)) return;
 
-    const queue = chatQueues.get(state.chatId);
-    if (!queue || !queue.processing) return;
+    resetTaskWatchdog(state.chatId);
 
     const message = event.message;
     if (!message || message.role !== "assistant") return;
@@ -654,14 +652,6 @@ export default function (pi: ExtensionAPI) {
     if (state.generation !== chatGeneration.get(state.chatId)) return;
 
     const chatId = state.chatId;
-    const watchdog = taskWatchdogTimers.get(chatId);
-    if (watchdog) {
-      clearTimeout(watchdog);
-      taskWatchdogTimers.delete(chatId);
-    }
-
-    const targetQueue = chatQueues.get(chatId);
-    if (!targetQueue || !targetQueue.processing) return;
 
     const allAssistantTexts: string[] = [];
 
@@ -695,8 +685,14 @@ export default function (pi: ExtensionAPI) {
 
     chatStates.delete(chatId);
 
-    const currentQueue = chatQueues.get(chatId);
-    if (currentQueue) currentQueue.processing = false;
+    // 状态清理完成后才清除看门狗，避免提前返回时任务失去保护
+    const watchdog = taskWatchdogTimers.get(chatId);
+    if (watchdog) {
+      clearTimeout(watchdog);
+      taskWatchdogTimers.delete(chatId);
+    }
+
+    globalQueue.processing = false;
     flushAllQueues();
     flashStatus("飞书: ✅ 完成");
   });
@@ -711,12 +707,10 @@ export default function (pi: ExtensionAPI) {
     if (!client || client.getStatus() !== "connected") return;
     if (ctxRef && !ctxRef.isIdle()) return;
 
-    for (const [chatId, queue] of chatQueues) {
-      if (!queue.processing && queue.queue.length > 0) {
-        dequeueAndProcess(chatId).catch(() => {
-          queue.processing = false;
-        });
-      }
+    if (!globalQueue.processing && globalQueue.items.length > 0) {
+      dequeueAndProcess().catch(() => {
+        globalQueue.processing = false;
+      });
     }
   }
 
@@ -793,14 +787,20 @@ export default function (pi: ExtensionAPI) {
     const existing = progressUpdateTimers.get(chatId);
     if (existing) clearTimeout(existing);
 
-    progressUpdateTimers.set(chatId, setTimeout(() => {
+    const timer = setTimeout(() => {
       progressUpdateTimers.delete(chatId);
       doUpdateProgressCard(state);
-    }, 300));
+    }, 300);
+    if (timer.unref) timer.unref();
+    progressUpdateTimers.set(chatId, timer);
   }
 
   function doUpdateProgressCard(state: ChatState): void {
     if (!client) return;
+
+    // 状态已被清理（任务完成/中断后 agent_end 的最终刷新）→ 只允许更新已有卡片，禁止新建
+    const isStale = chatStates.get(state.chatId) !== state;
+    if (isStale && !state.progressMsgId) return;
 
     const content = buildProgressCardContent(state.toolEntries);
     const runningCount = state.toolEntries.filter((e) => e.status === "running").length;
@@ -1118,6 +1118,8 @@ export default function (pi: ExtensionAPI) {
     }
     chatStates.clear();
     chatGeneration.clear();
+    globalQueue.items = [];
+    globalQueue.processing = false;
     for (const timer of progressUpdateTimers.values()) clearTimeout(timer);
     progressUpdateTimers.clear();
     for (const timer of taskWatchdogTimers.values()) clearTimeout(timer);
