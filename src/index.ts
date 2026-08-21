@@ -164,6 +164,30 @@ export default function (pi: ExtensionAPI) {
   /** 进度卡片更新防抖定时器 */
   const progressUpdateTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
 
+  /** 任务看门狗定时器：超时未活动则自动清理 */
+  const taskWatchdogTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
+  const TASK_WATCHDOG_MS = 5 * 60 * 1000;
+
+  function resetTaskWatchdog(chatId: string): void {
+    const existing = taskWatchdogTimers.get(chatId);
+    if (existing) clearTimeout(existing);
+
+    taskWatchdogTimers.set(chatId, setTimeout(() => {
+      taskWatchdogTimers.delete(chatId);
+      const state = chatStates.get(chatId);
+      if (!state) return;
+
+      client?.sendMessage(chatId, "任务超时：长时间无响应，已自动清理。").catch(() => {});
+      client?.stopTyping(chatId, false).catch(() => {});
+      chatStates.delete(chatId);
+      chatGeneration.set(chatId, (chatGeneration.get(chatId) ?? 0) + 1);
+      const queue = chatQueues.get(chatId);
+      if (queue) queue.processing = false;
+      flushAllQueues();
+      flashStatus("飞书: ⏰ 任务超时");
+    }, TASK_WATCHDOG_MS));
+  }
+
   // ─── 注册 CLI 标志 ────────────────────────────────────
 
   pi.registerFlag("feishu-app-id", {
@@ -335,6 +359,7 @@ export default function (pi: ExtensionAPI) {
     // 发送给 Pi
     const fullContent = item.text + (resourceDescription ? "\n" + resourceDescription : "");
     pi.sendUserMessage(fullContent);
+    resetTaskWatchdog(chatId);
   }
 
   // ─── 斜杠命令处理 ──────────────────────────────────────
@@ -362,6 +387,11 @@ export default function (pi: ExtensionAPI) {
           client?.stopTyping(chatId, false).catch(() => {});
           chatStates.delete(chatId);
           chatGeneration.set(chatId, (chatGeneration.get(chatId) ?? 0) + 1);
+          const watchdog = taskWatchdogTimers.get(chatId);
+          if (watchdog) {
+            clearTimeout(watchdog);
+            taskWatchdogTimers.delete(chatId);
+          }
         }
         if (queue) {
           queue.queue = [];
@@ -393,6 +423,11 @@ export default function (pi: ExtensionAPI) {
           client?.stopTyping(chatId, false).catch(() => {});
           chatStates.delete(chatId);
           chatGeneration.set(chatId, (chatGeneration.get(chatId) ?? 0) + 1);
+          const watchdog = taskWatchdogTimers.get(chatId);
+          if (watchdog) {
+            clearTimeout(watchdog);
+            taskWatchdogTimers.delete(chatId);
+          }
         }
         if (queue) {
           queue.queue = [];
@@ -493,6 +528,8 @@ export default function (pi: ExtensionAPI) {
     const state = findActiveState();
     if (!state) return;
 
+    resetTaskWatchdog(state.chatId);
+
     const toolName = event.toolName as string;
     const toolArgs = event.args as Record<string, unknown> | undefined;
     
@@ -530,6 +567,8 @@ export default function (pi: ExtensionAPI) {
     if (!client || client.getStatus() !== "connected") return;
     const state = findActiveState();
     if (!state) return;
+
+    resetTaskWatchdog(state.chatId);
 
     const toolCallId = event.toolCallId as string;
     const toolName = event.toolName as string;
@@ -587,6 +626,11 @@ export default function (pi: ExtensionAPI) {
       flashStatus("飞书: ⚠️ LLM 错误");
       
       // 清理状态，确保与 agent_end 流程一致
+      const watchdog = taskWatchdogTimers.get(state.chatId);
+      if (watchdog) {
+        clearTimeout(watchdog);
+        taskWatchdogTimers.delete(state.chatId);
+      }
       chatStates.delete(state.chatId);
       chatGeneration.set(state.chatId, (chatGeneration.get(state.chatId) ?? 0) + 1);
       const cleanupQueue = chatQueues.get(state.chatId);
@@ -621,10 +665,15 @@ export default function (pi: ExtensionAPI) {
 
     if (state.generation !== chatGeneration.get(state.chatId)) return;
 
-    const targetQueue = chatQueues.get(state.chatId);
-    if (!targetQueue || !targetQueue.processing) return;
-
     const chatId = state.chatId;
+    const watchdog = taskWatchdogTimers.get(chatId);
+    if (watchdog) {
+      clearTimeout(watchdog);
+      taskWatchdogTimers.delete(chatId);
+    }
+
+    const targetQueue = chatQueues.get(chatId);
+    if (!targetQueue || !targetQueue.processing) return;
 
     const allAssistantTexts: string[] = [];
 
@@ -1083,6 +1132,8 @@ export default function (pi: ExtensionAPI) {
     chatGeneration.clear();
     for (const timer of progressUpdateTimers.values()) clearTimeout(timer);
     progressUpdateTimers.clear();
+    for (const timer of taskWatchdogTimers.values()) clearTimeout(timer);
+    taskWatchdogTimers.clear();
   });
 
   // ─── 工具函数 ────────────────────────────────────────
