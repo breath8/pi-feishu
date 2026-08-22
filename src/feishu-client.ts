@@ -9,7 +9,7 @@
  */
 
 import * as Lark from "@larksuiteoapi/node-sdk";
-import { writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { writeFileSync, mkdirSync, existsSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { FeishuConfig, BridgeStatus } from "./types.js";
@@ -36,6 +36,8 @@ const DEDUP_SWEEP_INTERVAL = 5 * 60 * 1000;
 const MESSAGE_EXPIRY_MS = 30 * 60 * 60 * 1000;
 /** 媒体文件临时目录 */
 const MEDIA_TEMP_DIR = join(tmpdir(), "feishu-media");
+/** 临时文件保留期 */
+const MEDIA_TTL_MS = 24 * 60 * 60 * 1000;
 /** 飞书 Reaction emoji 类型 */
 const REACTION_TYPING = "Typing";
 const REACTION_CROSS_MARK = "CrossMark";
@@ -91,6 +93,10 @@ export class FeishuClient {
   private abortController: AbortController | null = null;
   private status: BridgeStatus = "disconnected";
 
+  // 重连
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconnectAttempts = 0;
+
   // 消息去重
   private dedupMap: Map<string, number> = new Map();
   private dedupSweepTimer: ReturnType<typeof setInterval> | null = null;
@@ -130,6 +136,23 @@ export class FeishuClient {
   }
 
   // ─── 公开 API ───────────────────────────────────────
+
+  private scheduleReconnect(): void {
+    if (this.reconnectTimer) return;
+    this.reconnectAttempts += 1;
+    if (this.reconnectAttempts > 5) {
+      _warn("WSClient: 重连尝试已用尽，请手动执行 /feishu start");
+      return;
+    }
+    const delayMs = Math.min(30000, 1000 * 2 ** this.reconnectAttempts);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (this.status === "connected" || this.status === "connecting") return;
+      _log(`WSClient: 自动重连 第${this.reconnectAttempts}次`);
+      this.connect().catch(() => {});
+    }, delayMs);
+    if (this.reconnectTimer.unref) this.reconnectTimer.unref();
+  }
 
   /** 连接飞书 WebSocket 长连接 */
   async connect(): Promise<void> {
@@ -180,6 +203,7 @@ export class FeishuClient {
         },
         onReady: () => {
           _log("WSClient: first connection established");
+          this.setStatus("connected");
         },
         onReconnecting: () => {
           _warn("WSClient: connection lost, reconnecting...");
@@ -192,15 +216,18 @@ export class FeishuClient {
         onError: (err: Error) => {
           _warn("WSClient: terminal error:", err.message);
           this.setStatus("error");
+          this.scheduleReconnect();
         },
       });
 
       this.patchCardEvents();
       this.startDedupSweep();
+      this.cleanMediaTempDir();
 
       await this.wsClient.start({ eventDispatcher: dispatcher });
 
-      this.setStatus("connected");
+      // start() 仅发起连接不等待握手；就绪由 onReady/onReconnected 置位
+      this.reconnectAttempts = 0;
       _log("Feishu WebSocket connected");
     } catch (err) {
       _warn("Connect failed:", err);
@@ -212,6 +239,8 @@ export class FeishuClient {
   /** 断开连接 */
   disconnect(): void {
     _log("Disconnecting...");
+    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
+    this.reconnectAttempts = 0;
 
     if (this.abortController) {
       this.abortController.abort();
@@ -319,6 +348,19 @@ export class FeishuClient {
   }
 
   // ─── 媒体收发 ──────────────────────────────────────────
+
+  private cleanMediaTempDir(): void {
+    try {
+      if (!existsSync(MEDIA_TEMP_DIR)) return;
+      const cutoff = Date.now() - MEDIA_TTL_MS;
+      for (const name of readdirSync(MEDIA_TEMP_DIR)) {
+        const p = join(MEDIA_TEMP_DIR, name);
+        try {
+          if (statSync(p).mtimeMs < cutoff) unlinkSync(p);
+        } catch { /* ignore */ }
+      }
+    } catch { /* ignore */ }
+  }
 
   /** 下载消息中的资源（图片/文件）到本地临时目录 */
   async downloadResource(
@@ -916,7 +958,10 @@ export class FeishuClient {
     if (!this.wsClient) return;
     const wsClientAny = this.wsClient as any;
     const origHandleEventData = wsClientAny.handleEventData?.bind(wsClientAny);
-    if (!origHandleEventData) return;
+    if (!origHandleEventData) {
+      _warn("patchCardEvents: SDK handleEventData 不存在，卡片回调将失效（SDK 版本变更？）");
+      return;
+    }
 
     wsClientAny.handleEventData = (data: any) => {
       const msgType = data?.headers?.find?.((h: any) => h?.key === "type")?.value;
