@@ -170,8 +170,11 @@ export default function (pi: ExtensionAPI) {
   /** 任务看门狗定时器：超时未活动则自动清理 */
   const taskWatchdogTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   const TASK_WATCHDOG_MS = 5 * 60 * 1000;
+  const watchdogExtensionCounts: Map<string, number> = new Map();
+  const WATCHDOG_MAX_EXTENSIONS = 12;
 
-  function resetTaskWatchdog(chatId: string): void {
+  function resetTaskWatchdog(chatId: string, fresh = false): void {
+    if (fresh) watchdogExtensionCounts.delete(chatId);
     const existing = taskWatchdogTimers.get(chatId);
     if (existing) clearTimeout(existing);
 
@@ -180,9 +183,17 @@ export default function (pi: ExtensionAPI) {
 
       // Pi 仍在工作（长工具执行/长文本生成）→ 顺延看门狗，避免误杀活跃任务
       if (ctxRef && !ctxRef.isIdle()) {
-        resetTaskWatchdog(chatId);
-        return;
+        const used = watchdogExtensionCounts.get(chatId) ?? 0;
+        if (used >= WATCHDOG_MAX_EXTENSIONS) {
+          watchdogExtensionCounts.delete(chatId);
+          flashStatus("飞书: ⏰ 任务疑似挂死");
+        } else {
+          watchdogExtensionCounts.set(chatId, used + 1);
+          resetTaskWatchdog(chatId);
+          return;
+        }
       }
+      watchdogExtensionCounts.delete(chatId);
 
       const state = chatStates.get(chatId);
       if (!state) return;
@@ -348,6 +359,9 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
+    // 排队在媒体下载期间被 /stop 或 /new 清除 → 丢弃这条已出队的消息
+    if (!globalQueue.processing) return;
+
     // 初始化聊天状态
     const gen = (chatGeneration.get(chatId) ?? 0) + 1;
     chatGeneration.set(chatId, gen);
@@ -366,7 +380,7 @@ export default function (pi: ExtensionAPI) {
     // 发送给 Pi
     const fullContent = item.text + (resourceDescription ? "\n" + resourceDescription : "");
     pi.sendUserMessage(fullContent);
-    resetTaskWatchdog(chatId);
+    resetTaskWatchdog(chatId, true);
   }
 
   // ─── 斜杠命令处理 ──────────────────────────────────────
@@ -399,8 +413,13 @@ export default function (pi: ExtensionAPI) {
             taskWatchdogTimers.delete(chatId);
           }
         }
+        const droppedByChat = new Map<string, number>();
+        for (const it of globalQueue.items) droppedByChat.set(it.chatId, (droppedByChat.get(it.chatId) ?? 0) + 1);
         globalQueue.items = [];
         globalQueue.processing = false;
+        for (const [cid, n] of droppedByChat) {
+          if (cid !== chatId) client?.sendMessage(cid, `排队任务已被其他会话的命令清空（${n} 条）。会话已被重置。`).catch(() => {});
+        }
 
         // 中断当前处理
         if (ctxRef && !ctxRef.isIdle()) {
@@ -432,8 +451,13 @@ export default function (pi: ExtensionAPI) {
             taskWatchdogTimers.delete(chatId);
           }
         }
+        const droppedByChat = new Map<string, number>();
+        for (const it of globalQueue.items) droppedByChat.set(it.chatId, (droppedByChat.get(it.chatId) ?? 0) + 1);
         globalQueue.items = [];
         globalQueue.processing = false;
+        for (const [cid, n] of droppedByChat) {
+          if (cid !== chatId) client?.sendMessage(cid, `排队任务已被其他会话的命令清空（${n} 条）。任务已被中断。`).catch(() => {});
+        }
 
         if (ctxRef && !ctxRef.isIdle()) {
           ctxRef.abort();
@@ -666,7 +690,12 @@ export default function (pi: ExtensionAPI) {
 
     const finalText = allAssistantTexts.join("\n");
 
-    if (finalText) {
+    if (!finalText) {
+      const lastMsg = event.messages?.[event.messages.length - 1] as any;
+      if (lastMsg?.stopReason === "error") {
+        client.sendMessage(chatId, "任务已完成，但最终回复生成失败（LLM 流中断）。", state.userMsgId).catch(() => {});
+      }
+    } else {
       const processed = downgradeHeadings(finalText);
       const chunks = chunkText(processed, MAX_TEXT_CHUNK);
       for (const chunk of chunks) {
@@ -967,7 +996,11 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      await client.sendMessage(chatId, downgradeHeadings(message));
+      try {
+        await client.sendMessage(chatId, downgradeHeadings(message));
+      } catch (err) {
+        return { content: [{ type: "text" as const, text: `错误: 发送到飞书失败 ${err}` }], details: {} as Record<string, unknown> };
+      }
       return {
         content: [{ type: "text" as const, text: `已发送到飞书 [${chatId}]: ${message}` }],
         details: { sent: true, chatId, message } as Record<string, unknown>,
@@ -1025,7 +1058,11 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      await client.sendImage(chatId, imageKey);
+      try {
+        await client.sendImage(chatId, imageKey);
+      } catch (err) {
+        return { content: [{ type: "text" as const, text: `错误: 图片发送失败 ${err}` }], details: {} as Record<string, unknown> };
+      }
       return {
         content: [{ type: "text" as const, text: `图片已发送到飞书 [${chatId}]: ${filePath}` }],
         details: { sent: true, chatId, filePath, imageKey } as Record<string, unknown>,
@@ -1085,7 +1122,11 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      await client.sendFile(chatId, fileKey);
+      try {
+        await client.sendFile(chatId, fileKey);
+      } catch (err) {
+        return { content: [{ type: "text" as const, text: `错误: 文件发送失败 ${err}` }], details: {} as Record<string, unknown> };
+      }
       return {
         content: [{ type: "text" as const, text: `文件已发送到飞书 [${chatId}]: ${fileName}` }],
         details: { sent: true, chatId, filePath, fileName, fileKey } as Record<string, unknown>,
