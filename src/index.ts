@@ -1190,14 +1190,17 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     ctxRef = ctx;
-    updateStatus(ctx, "disconnected");
+    updateStatus(ctx, client?.getStatus() ?? "disconnected");
 
-    try {
-      await startFeishuClient();
-    } catch (err) {
-      if (ctx.hasUI) {
-        ctx.ui.notify(`飞书连接失败: ${err}`, "error");
-      }
+    // 绝不阻塞核心的会话启动链路：此前 await 重连导致 newSession 悬挂，
+    // 飞书侧永远停在「正在切换到全新会话…」。仅在连接确实失效时后台重启。
+    if (!client || client.getStatus() === "disconnected" || client.getStatus() === "error") {
+      void startFeishuClient().catch((err) => {
+        console.warn("[feishu] 会话启动时连接失败:", err);
+        if (ctx.hasUI) {
+          ctx.ui.notify(`飞书连接失败: ${err}`, "error");
+        }
+      });
     }
 
     // 启动后刷新积压的队列
