@@ -173,6 +173,9 @@ export default function (pi: ExtensionAPI) {
   const watchdogExtensionCounts: Map<string, number> = new Map();
   const WATCHDOG_MAX_EXTENSIONS = 12;
 
+  /** 飞书 /new → 内部命令 fsnew 的待回执请求（记录发起聊天，成功后定向通知） */
+  let pendingNewSession: { chatId: string; userMsgId: string } | null = null;
+
   function resetTaskWatchdog(chatId: string, fresh = false): void {
     if (fresh) watchdogExtensionCounts.delete(chatId);
     const existing = taskWatchdogTimers.get(chatId);
@@ -383,6 +386,22 @@ export default function (pi: ExtensionAPI) {
     resetTaskWatchdog(chatId, true);
   }
 
+  /** 清空全部聊天的桥接层任务状态（真实新建会话前调用；区别于 /stop 的单聊天清理） */
+  function resetBridgeTaskState(): void {
+    for (const cid of chatStates.keys()) {
+      client?.stopTyping(cid, false).catch(() => {});
+    }
+    chatStates.clear();
+    for (const cid of [...chatGeneration.keys()]) {
+      chatGeneration.set(cid, (chatGeneration.get(cid) ?? 0) + 1);
+    }
+    for (const t of taskWatchdogTimers.values()) clearTimeout(t);
+    taskWatchdogTimers.clear();
+    watchdogExtensionCounts.clear();
+    globalQueue.items = [];
+    globalQueue.processing = false;
+  }
+
   // ─── 斜杠命令处理 ──────────────────────────────────────
 
   /**
@@ -400,39 +419,31 @@ export default function (pi: ExtensionAPI) {
 
     switch (cmd) {
       case "/new": {
-        // 清空飞书侧状态（Pi 会话全局共享，/new 影响所有聊天的排队任务）
-        const state = chatStates.get(chatId);
-
-        if (state) {
-          client?.stopTyping(chatId, false).catch(() => {});
-          chatStates.delete(chatId);
-          chatGeneration.set(chatId, (chatGeneration.get(chatId) ?? 0) + 1);
-          const watchdog = taskWatchdogTimers.get(chatId);
-          if (watchdog) {
-            clearTimeout(watchdog);
-            taskWatchdogTimers.delete(chatId);
-          }
-        }
+        // 真实新建会话：经 prompt() 命令路由转发给注册命令 fsnew，
+        // 其处理器持有含 newSession() 的 ExtensionCommandContext（compact 无法清空小会话）
         const droppedByChat = new Map<string, number>();
         for (const it of globalQueue.items) droppedByChat.set(it.chatId, (droppedByChat.get(it.chatId) ?? 0) + 1);
-        globalQueue.items = [];
-        globalQueue.processing = false;
-        for (const [cid, n] of droppedByChat) {
-          if (cid !== chatId) client?.sendMessage(cid, `排队任务已被其他会话的命令清空（${n} 条）。会话已被重置。`).catch(() => {});
-        }
 
         // 中断当前处理
         if (ctxRef && !ctxRef.isIdle()) {
           ctxRef.abort();
         }
 
-        // 压缩上下文清除历史
-        if (ctxRef) {
-          ctxRef.compact();
-          await client?.sendMessage(chatId, "会话已重置，上下文已清空。", msgId);
-        } else {
-          await client?.sendMessage(chatId, "无法重置：会话上下文不可用。", msgId);
+        resetBridgeTaskState();
+
+        for (const [cid, n] of droppedByChat) {
+          if (cid !== chatId) client?.sendMessage(cid, `排队任务已被其他会话的命令清空（${n} 条）。会话已被重置。`).catch(() => {});
         }
+
+        pendingNewSession = { chatId, userMsgId: msgId };
+        // 本地类型包(0.74)落后于运行时(0.84)：expandPromptTemplates 已在运行时支持，
+        // 用于把文本路由进 prompt() 的扩展命令分发器
+        const sendWithCommandRouting = pi.sendUserMessage as (
+          content: string,
+          options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
+        ) => void;
+        sendWithCommandRouting("/fsnew", { expandPromptTemplates: true });
+        await client?.sendMessage(chatId, "正在切换到全新会话…", msgId);
         break;
       }
 
@@ -883,6 +894,20 @@ export default function (pi: ExtensionAPI) {
   }
 
   // ─── 注册 /feishu 命令 ────────────────────────────────
+
+  // 飞书 /new 的真实实现：经 prompt() 命令路由进入此处理器，
+  // 此处 ctx 为 ExtensionCommandContext，持有真正的 newSession()
+  pi.registerCommand("fsnew", {
+    description: "内部命令：由飞书 /new 触发，切换到全新会话",
+    handler: async (_args: string, cmdCtx: ExtensionCommandContext) => {
+      const req = pendingNewSession;
+      pendingNewSession = null;
+      const result = await cmdCtx.newSession();
+      if (!result.cancelled && req) {
+        await client?.sendMessage(req.chatId, "✅ 已进入全新会话（历史已彻底清空）。", req.userMsgId).catch(() => {});
+      }
+    },
+  });
 
   pi.registerCommand("feishu", {
     description: "管理飞书 Bot 连接 (start/stop/status/config/help)",
