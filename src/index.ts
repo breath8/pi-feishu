@@ -444,15 +444,17 @@ export default function (pi: ExtensionAPI) {
         ) => void;
         sendWithCommandRouting("/fsnew", { expandPromptTemplates: true });
         console.warn(`[feishu/new ${new Date().toISOString().slice(11,23)}] 路由调用已同步返回`);
-        await client?.sendMessage(chatId, "正在切换到全新会话…", msgId);
+        await client?.sendMessage(chatId, "正在切换到全新会话…（约需 15-20 秒）", msgId);
+        // 跨实例共享：新会话会重建模块实例，旧实例的 pending 不可见，需经 globalThis 传递
+        (globalThis as any).__feishuPendingNewSession = { chatId, userMsgId: msgId, ts: Date.now() };
 
         const switchReq = pendingNewSession;
         const switchTimeout = setTimeout(() => {
           if (pendingNewSession === switchReq) {
-            console.error(`[feishu/new ${new Date().toISOString().slice(11,23)}] 15秒未收到 fsnew 回执，处理器可能未执行或通知链路故障`);
-            client?.sendMessage(chatId, "⚠️ 会话切换回执超时。切换本身可能已成功（可用任意消息验证上下文是否清空），请把终端日志发给我排查。", msgId).catch(() => {});
+            console.error(`[feishu/new ${new Date().toISOString().slice(11,23)}] 30秒未收到 fsnew 回执，处理器可能未执行或通知链路故障`);
+            client?.sendMessage(chatId, "⚠️ 会话切换回执超时。切换本身可能已成功（新会话文件已创建，可用任意消息验证上下文是否清空），请把终端日志发给我排查。", msgId).catch(() => {});
           }
-        }, 15000);
+        }, 30000);
         if (switchTimeout.unref) switchTimeout.unref();
         break;
       }
@@ -919,28 +921,21 @@ export default function (pi: ExtensionAPI) {
           console.warn(`[feishu/fsnew ${new Date().toISOString().slice(11,23)}] 延迟体启动，调用 cmdCtx.newSession()`);
           try {
             const result = await cmdCtx.newSession();
-            console.warn(`[feishu/fsnew] newSession 返回 cancelled=${result.cancelled}`);
+            console.warn(`[feishu/fsnew ${new Date().toISOString().slice(11,23)}] newSession 返回 cancelled=${result.cancelled}`);
+            // 成功后回执由新实例的 session_start 经 globalThis 发送（旧实例的 client 已在
+            // session_shutdown 中置空，无法直接发送）。此处仅清理旧实例的挂起态。
             if (result.cancelled) {
+              (globalThis as any).__feishuPendingNewSession = undefined;
               if (req) await client?.sendMessage(req.chatId, "⚠️ 会话切换被取消，原会话保留。", req.userMsgId).catch(() => {});
               pendingNewSession = null;
               return;
             }
-            if (!req) return;
-            try {
-              await client?.sendMessage(req.chatId, "✅ 已进入全新会话（历史已彻底清空）。", req.userMsgId);
-            } catch (err) {
-              console.warn("[feishu/fsnew] 回执失败（reply 路径）:", err);
-              try {
-                await client?.sendMessage(req.chatId, "✅ 已进入全新会话（历史已彻底清空）。");
-                pendingNewSession = null;
-              } catch (err2) {
-                console.error("[feishu/fsnew] 兜底发送仍失败:", err2);
-              }
-              return;
-            }
             pendingNewSession = null;
+            if (!req) return;
+            console.warn(`[feishu/fsnew ${new Date().toISOString().slice(11,23)}] newSession 成功，等待新实例回执`);
           } catch (err) {
             console.error("[feishu/fsnew] newSession 抛错:", err);
+            (globalThis as any).__feishuPendingNewSession = undefined;
             if (req) {
               await client?.sendMessage(req.chatId, `⚠️ 会话切换失败：${err}`, req.userMsgId).catch(() => {});
               pendingNewSession = null;
@@ -1216,6 +1211,35 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify(`飞书连接失败: ${err}`, "error");
         }
       });
+    }
+
+    // 新会话回执兜底：fsnew 的旧实例与新实例不共享闭包，需经 globalThis 传递
+    const pending = (globalThis as any).__feishuPendingNewSession as
+      | { chatId: string; userMsgId: string; ts: number }
+      | undefined;
+    if (_event.reason === "new" && pending && Date.now() - pending.ts < 60000) {
+      (globalThis as any).__feishuPendingNewSession = undefined;
+      pendingNewSession = null;
+      // 等待飞书连接就绪再发送（切换时会先断开再重连）
+      const trySend = async (attempts = 0): Promise<void> => {
+        const status = client?.getStatus();
+        if (status === "connected" && client) {
+          try {
+            await client.sendMessage(pending.chatId, "✅ 已进入全新会话（历史已彻底清空）。", pending.userMsgId);
+            console.warn(`[feishu/fsnew ${new Date().toISOString().slice(11,23)}] 回执已发送（经 session_start）`);
+          } catch (err) {
+            console.warn("[feishu/fsnew] 回执失败（session_start 路径）:", err);
+            try {
+              await client.sendMessage(pending.chatId, "✅ 已进入全新会话（历史已彻底清空）。");
+            } catch {}
+          }
+          return;
+        }
+        if (attempts < 10) {
+          setTimeout(() => void trySend(attempts + 1), 1000);
+        }
+      };
+      void trySend();
     }
 
     // 启动后刷新积压的队列
