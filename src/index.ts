@@ -1246,10 +1246,13 @@ export default function (pi: ExtensionAPI) {
     flushAllQueues();
   });
 
-  pi.on("session_shutdown", async () => {
-    if (client) {
-      client.disconnect();
-      client = null;
+  pi.on("session_shutdown", async (event: any) => {
+    // 仅进程退出时断开飞书，会话切换(new/fork)时保留健康连接以避免重连窗口丢消息
+    if (!event || event.reason === "quit" || event.reason === "shutdown") {
+      if (client) {
+        client.disconnect();
+        client = null;
+      }
     }
     chatStates.clear();
     chatGeneration.clear();
