@@ -134,9 +134,35 @@ interface ChatState {
 // ─── 扩展入口 ───────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-  let client: FeishuClient | null = null;
   let config: FeishuConfig = loadConfig();
   let ctxRef: ExtensionContext | null = null;
+  // 跨实例共享飞书客户端，避免新会话重建时旧连接丢失
+  let client: FeishuClient | null = (globalThis as any).__feishuClient ?? null;
+  const isCtxIdle = (): boolean => {
+    try {
+      return !ctxRef || ctxRef.isIdle();
+    } catch {
+      return true;
+    }
+  };
+  const safeSendToPi = (content: string): void => {
+    const stashed = (globalThis as any).__feishuCmdCtx as any;
+    const candidates: any[] = [];
+    if (stashed) candidates.push(stashed);
+    if (ctxRef) candidates.push(ctxRef);
+    candidates.push(pi);
+    for (const c of candidates) {
+      if (typeof c?.sendUserMessage !== "function") continue;
+      try {
+        c.sendUserMessage(content);
+        return;
+      } catch (e) {
+        if (!String(e).includes("stale")) throw e;
+      }
+    }
+    // 兜底：所有候选均 stale 或缺方法时，直接尝试 pi（会抛 stale 则由上层捕获）
+    (pi as any).sendUserMessage(content);
+  };
 
   /** 每个聊天独立的状态 */
   const chatStates: Map<string, ChatState> = new Map();
@@ -185,7 +211,7 @@ export default function (pi: ExtensionAPI) {
       taskWatchdogTimers.delete(chatId);
 
       // Pi 仍在工作（长工具执行/长文本生成）→ 顺延看门狗，避免误杀活跃任务
-      if (ctxRef && !ctxRef.isIdle()) {
+      if (!isCtxIdle()) {
         const used = watchdogExtensionCounts.get(chatId) ?? 0;
         if (used >= WATCHDOG_MAX_EXTENSIONS) {
           watchdogExtensionCounts.delete(chatId);
@@ -247,6 +273,7 @@ export default function (pi: ExtensionAPI) {
     if (client) {
       client.disconnect();
       client = null;
+      (globalThis as any).__feishuClient = null;
     }
 
     const flagMap: Record<string, string> = {
@@ -271,6 +298,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     client = new FeishuClient(config);
+    (globalThis as any).__feishuClient = client;
 
     client.setOnMessage((chatId, msgId, text, chatType, resources) => {
       handleFeishuMessage(chatId, msgId, text, chatType, resources);
@@ -333,9 +361,14 @@ export default function (pi: ExtensionAPI) {
     }
 
     // Pi 正忙（压缩中/流式中）→ 不出队，保持 processing=false 等空闲时再触发
-    if (ctxRef && !ctxRef.isIdle()) {
-      globalQueue.processing = false;
-      return;
+    try {
+      if (ctxRef && !ctxRef.isIdle()) {
+        globalQueue.processing = false;
+        return;
+      }
+    } catch {
+      // 替换会话后旧 ctx 变 stale，新 ctx 尚未就绪时视为可出队
+
     }
 
     globalQueue.processing = true;
@@ -382,7 +415,7 @@ export default function (pi: ExtensionAPI) {
 
     // 发送给 Pi
     const fullContent = item.text + (resourceDescription ? "\n" + resourceDescription : "");
-    pi.sendUserMessage(fullContent);
+    safeSendToPi(fullContent);
     resetTaskWatchdog(chatId, true);
   }
 
@@ -419,15 +452,15 @@ export default function (pi: ExtensionAPI) {
 
     switch (cmd) {
       case "/new": {
-        // 真实新建会话：经 prompt() 命令路由转发给注册命令 fsnew，
-        // 其处理器持有含 newSession() 的 ExtensionCommandContext（compact 无法清空小会话）
+        // 真实新建会话：优先复用 withSession 存档的最新命令上下文直调 newSession()；
+        // 仅首次（无存档）或存档 stale 时才经 prompt() 路由到 fsnew
         const droppedByChat = new Map<string, number>();
         for (const it of globalQueue.items) droppedByChat.set(it.chatId, (droppedByChat.get(it.chatId) ?? 0) + 1);
 
         // 中断当前处理
-        if (ctxRef && !ctxRef.isIdle()) {
-          ctxRef.abort();
-        }
+        try {
+          if (ctxRef && !ctxRef.isIdle()) ctxRef.abort();
+        } catch {}
 
         resetBridgeTaskState();
 
@@ -435,23 +468,36 @@ export default function (pi: ExtensionAPI) {
           if (cid !== chatId) client?.sendMessage(cid, `排队任务已被其他会话的命令清空（${n} 条）。会话已被重置。`).catch(() => {});
         }
 
-        pendingNewSession = { chatId, userMsgId: msgId };
-        // 本地类型包(0.74)落后于运行时(0.84)：expandPromptTemplates 已在运行时支持，
-        // 用于把文本路由进 prompt() 的扩展命令分发器
-        const sendWithCommandRouting = pi.sendUserMessage as (
-          content: string,
-          options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
-        ) => void;
-        sendWithCommandRouting("/fsnew", { expandPromptTemplates: true });
-        console.warn(`[feishu/new ${new Date().toISOString().slice(11,23)}] 路由调用已同步返回`);
-        await client?.sendMessage(chatId, "正在切换到全新会话…（约需 15-20 秒）", msgId);
-        // 跨实例共享：新会话会重建模块实例，旧实例的 pending 不可见，需经 globalThis 传递
+        await client?.sendMessage(chatId, "正在切换到全新会话…", msgId);
         (globalThis as any).__feishuPendingNewSession = { chatId, userMsgId: msgId, ts: Date.now() };
+        pendingNewSession = { chatId, userMsgId: msgId };
 
-        const switchReq = pendingNewSession;
+        const stashed = (globalThis as any).__feishuCmdCtx as ExtensionCommandContext | undefined;
+        let routed = false;
+        if (stashed) {
+          routed = await performNewSession(stashed, "存档上下文");
+        }
+        if (!routed) {
+          // 本地类型包(0.74)落后于运行时(0.84)：expandPromptTemplates 已在运行时支持，
+          // 用于把文本路由进 prompt() 的扩展命令分发器
+          const sendWithCommandRouting = pi.sendUserMessage as (
+            content: string,
+            options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
+          ) => void;
+          try {
+            sendWithCommandRouting("/fsnew", { expandPromptTemplates: true });
+          } catch (err) {
+
+            (globalThis as any).__feishuPendingNewSession = undefined;
+            await client?.sendMessage(chatId, `⚠️ 会话切换失败：${err}`, msgId).catch(() => {});
+          }
+        }
+
+        const switchGlobal = (globalThis as any).__feishuPendingNewSession;
+        if (!switchGlobal) break;
         const switchTimeout = setTimeout(() => {
-          if (pendingNewSession === switchReq) {
-            console.error(`[feishu/new ${new Date().toISOString().slice(11,23)}] 30秒未收到 fsnew 回执，处理器可能未执行或通知链路故障`);
+          if ((globalThis as any).__feishuPendingNewSession === switchGlobal) {
+
             client?.sendMessage(chatId, "⚠️ 会话切换回执超时。切换本身可能已成功（新会话文件已创建，可用任意消息验证上下文是否清空），请把终端日志发给我排查。", msgId).catch(() => {});
           }
         }, 30000);
@@ -482,10 +528,14 @@ export default function (pi: ExtensionAPI) {
           if (cid !== chatId) client?.sendMessage(cid, `排队任务已被其他会话的命令清空（${n} 条）。任务已被中断。`).catch(() => {});
         }
 
-        if (ctxRef && !ctxRef.isIdle()) {
-          ctxRef.abort();
-          await client?.sendMessage(chatId, "已中断当前处理，队列已清空。", msgId);
-        } else if (clearedCount > 0) {
+        try {
+          if (ctxRef && !ctxRef.isIdle()) {
+            ctxRef.abort();
+            await client?.sendMessage(chatId, "已中断当前处理，队列已清空。", msgId);
+            break;
+          }
+        } catch {}
+        if (clearedCount > 0) {
           await client?.sendMessage(chatId, `已清空 ${clearedCount} 条排队消息。`, msgId);
         } else {
           await client?.sendMessage(chatId, "当前没有正在处理的任务。", msgId);
@@ -757,7 +807,7 @@ export default function (pi: ExtensionAPI) {
    */
   function flushAllQueues(): void {
     if (!client || client.getStatus() !== "connected") return;
-    if (ctxRef && !ctxRef.isIdle()) return;
+    if (!isCtxIdle()) return;
 
     if (!globalQueue.processing && globalQueue.items.length > 0) {
       dequeueAndProcess().catch(() => {
@@ -907,42 +957,58 @@ export default function (pi: ExtensionAPI) {
 
   // ─── 注册 /feishu 命令 ────────────────────────────────
 
-  // 飞书 /new 的真实实现：经 prompt() 命令路由进入此处理器，
-  // 此处 ctx 为 ExtensionCommandContext，持有真正的 newSession()
+  // 飞书 /new 的真实实现：执行会话切换并发送回执。
+  // 返回 true=已处理（成功/取消/非stale错误）；false=cmdCtx 已 stale，调用方需降级路由。
+  async function performNewSession(
+    cmdCtx: ExtensionCommandContext,
+    source: string,
+  ): Promise<boolean> {
+    const req = (globalThis as any).__feishuPendingNewSession as
+      | { chatId: string; userMsgId: string; ts: number }
+      | undefined;
+
+    let result;
+    try {
+      result = await cmdCtx.newSession({
+        withSession: async (newCtx) => {
+          (globalThis as any).__feishuCmdCtx = newCtx;
+          ctxRef = newCtx as unknown as ExtensionContext;
+        },
+      });
+    } catch (err) {
+      if (String(err).includes("stale")) {
+
+        return false;
+      }
+
+      (globalThis as any).__feishuPendingNewSession = undefined;
+      pendingNewSession = null;
+      if (req) await client?.sendMessage(req.chatId, `⚠️ 会话切换失败：${err}`, req.userMsgId).catch(() => {});
+      return true;
+    }
+
+    pendingNewSession = null;
+    if (result.cancelled) {
+      (globalThis as any).__feishuPendingNewSession = undefined;
+      if (req) await client?.sendMessage(req.chatId, "⚠️ 会话切换被取消，原会话保留。", req.userMsgId).catch(() => {});
+      return true;
+    }
+    if (!req) return true;
+    try {
+      await client?.sendMessage(req.chatId, "✅ 已进入全新会话。", req.userMsgId);
+
+      (globalThis as any).__feishuPendingNewSession = undefined;
+    } catch (err) {
+
+    }
+    return true;
+  }
+
+  // 首次 /new 的路由入口：经 prompt() 命令分发获得命令上下文后走同一 performNewSession
   pi.registerCommand("fsnew", {
     description: "内部命令：由飞书 /new 触发，切换到全新会话",
     handler: async (_args: string, cmdCtx: ExtensionCommandContext) => {
-      const req = pendingNewSession;
-      console.warn(`[feishu/fsnew ${new Date().toISOString().slice(11,23)}] 处理器进入`);
-      // 关键：必须脱离 prompt() 调用栈后再切换。在未决的 prompt 上做会话替换
-      // 会形成循环等待（等待自身所在的栈退绕），表现为 newSession 永不返回。
-      setTimeout(() => {
-        void (async () => {
-          console.warn(`[feishu/fsnew ${new Date().toISOString().slice(11,23)}] 延迟体启动，调用 cmdCtx.newSession()`);
-          try {
-            const result = await cmdCtx.newSession();
-            console.warn(`[feishu/fsnew ${new Date().toISOString().slice(11,23)}] newSession 返回 cancelled=${result.cancelled}`);
-            // 成功后回执由新实例的 session_start 经 globalThis 发送（旧实例的 client 已在
-            // session_shutdown 中置空，无法直接发送）。此处仅清理旧实例的挂起态。
-            if (result.cancelled) {
-              (globalThis as any).__feishuPendingNewSession = undefined;
-              if (req) await client?.sendMessage(req.chatId, "⚠️ 会话切换被取消，原会话保留。", req.userMsgId).catch(() => {});
-              pendingNewSession = null;
-              return;
-            }
-            pendingNewSession = null;
-            if (!req) return;
-            console.warn(`[feishu/fsnew ${new Date().toISOString().slice(11,23)}] newSession 成功，等待新实例回执`);
-          } catch (err) {
-            console.error("[feishu/fsnew] newSession 抛错:", err);
-            (globalThis as any).__feishuPendingNewSession = undefined;
-            if (req) {
-              await client?.sendMessage(req.chatId, `⚠️ 会话切换失败：${err}`, req.userMsgId).catch(() => {});
-              pendingNewSession = null;
-            }
-          }
-        })();
-      }, 25);
+      await performNewSession(cmdCtx, "路由上下文");
     },
   });
 
@@ -1211,13 +1277,23 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify(`飞书连接失败: ${err}`, "error");
         }
       });
+    } else {
+      // 复用健康连接时，更新回调指向新实例的处理器（旧实例闭包已 stale）
+      try {
+        client.setOnMessage((chatId, msgId, text, chatType, resources) => {
+          handleFeishuMessage(chatId, msgId, text, chatType, resources);
+        });
+        client.setOnStatusChange((status) => updateStatus(ctx, status));
+      } catch {}
+      (globalThis as any).__feishuClient = client;
     }
 
-    // 新会话回执兜底：fsnew 的旧实例与新实例不共享闭包，需经 globalThis 传递
-    const pending = (globalThis as any).__feishuPendingNewSession as
-      | { chatId: string; userMsgId: string; ts: number }
-      | undefined;
-    if (_event.reason === "new" && pending && Date.now() - pending.ts < 60000) {
+    // 新会话回执兜底：仅当旧实例直接发送失败且全局仍挂起时才重试（延迟 2 秒避让主路径）
+    setTimeout(() => {
+      const pending = (globalThis as any).__feishuPendingNewSession as
+        | { chatId: string; userMsgId: string; ts: number }
+        | undefined;
+      if (_event.reason !== "new" || !pending || Date.now() - pending.ts >= 60000) return;
       (globalThis as any).__feishuPendingNewSession = undefined;
       pendingNewSession = null;
       // 等待飞书连接就绪再发送（切换时会先断开再重连）
@@ -1225,12 +1301,12 @@ export default function (pi: ExtensionAPI) {
         const status = client?.getStatus();
         if (status === "connected" && client) {
           try {
-            await client.sendMessage(pending.chatId, "✅ 已进入全新会话（历史已彻底清空）。", pending.userMsgId);
-            console.warn(`[feishu/fsnew ${new Date().toISOString().slice(11,23)}] 回执已发送（经 session_start）`);
+            await client.sendMessage(pending.chatId, "✅ 已进入全新会话。", pending.userMsgId);
+
           } catch (err) {
-            console.warn("[feishu/fsnew] 回执失败（session_start 路径）:", err);
+
             try {
-              await client.sendMessage(pending.chatId, "✅ 已进入全新会话（历史已彻底清空）。");
+              await client.sendMessage(pending.chatId, "✅ 已进入全新会话。");
             } catch {}
           }
           return;
@@ -1240,7 +1316,7 @@ export default function (pi: ExtensionAPI) {
         }
       };
       void trySend();
-    }
+    }, 2000);
 
     // 启动后刷新积压的队列
     flushAllQueues();
@@ -1252,6 +1328,7 @@ export default function (pi: ExtensionAPI) {
       if (client) {
         client.disconnect();
         client = null;
+        (globalThis as any).__feishuClient = null;
       }
     }
     chatStates.clear();
@@ -1344,7 +1421,13 @@ export default function (pi: ExtensionAPI) {
   let currentStatusText: string = "";
 
   function updateStatus(ctx: ExtensionContext | null, status: string): void {
-    if (!ctx?.hasUI) return;
+    let hasUI = false;
+    try {
+      hasUI = !!ctx?.hasUI;
+    } catch {
+      return;
+    }
+    if (!hasUI) return;
 
     if (statusTimer) {
       clearTimeout(statusTimer);
@@ -1361,16 +1444,26 @@ export default function (pi: ExtensionAPI) {
     const text = statusMap[status] ?? `飞书: ${status}`;
     if (currentStatusText === text) return;
     currentStatusText = text;
-    ctx.ui.setStatus("feishu", text);
+    try {
+      ctx?.ui.setStatus("feishu", text);
+    } catch {}
   }
 
   function flashStatus(message: string): void {
-    if (!ctxRef?.hasUI) return;
+    let hasUI = false;
+    try {
+      hasUI = !!ctxRef?.hasUI;
+    } catch {
+      return;
+    }
+    if (!hasUI) return;
     if (statusTimer) clearTimeout(statusTimer);
 
     if (currentStatusText === message) return;
     currentStatusText = message;
-    ctxRef.ui.setStatus("feishu", message);
+    try {
+      ctxRef!.ui.setStatus("feishu", message);
+    } catch {}
 
     statusTimer = setTimeout(() => {
       statusTimer = null;
@@ -1378,7 +1471,9 @@ export default function (pi: ExtensionAPI) {
         const text = "飞书: 已连接";
         if (currentStatusText !== text) {
           currentStatusText = text;
-          ctxRef?.ui.setStatus("feishu", text);
+          try {
+            ctxRef?.ui.setStatus("feishu", text);
+          } catch {}
         }
       }
     }, 3000);
