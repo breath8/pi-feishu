@@ -443,13 +443,13 @@ export default function (pi: ExtensionAPI) {
           options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
         ) => void;
         sendWithCommandRouting("/fsnew", { expandPromptTemplates: true });
-        console.warn("[feishu/new] 路由调用已同步返回");
+        console.warn(`[feishu/new ${new Date().toISOString().slice(11,23)}] 路由调用已同步返回`);
         await client?.sendMessage(chatId, "正在切换到全新会话…", msgId);
 
         const switchReq = pendingNewSession;
         const switchTimeout = setTimeout(() => {
           if (pendingNewSession === switchReq) {
-            console.error("[feishu/new] 15秒未收到 fsnew 回执，处理器可能未执行或通知链路故障");
+            console.error(`[feishu/new ${new Date().toISOString().slice(11,23)}] 15秒未收到 fsnew 回执，处理器可能未执行或通知链路故障`);
             client?.sendMessage(chatId, "⚠️ 会话切换回执超时。切换本身可能已成功（可用任意消息验证上下文是否清空），请把终端日志发给我排查。", msgId).catch(() => {});
           }
         }, 15000);
@@ -911,11 +911,12 @@ export default function (pi: ExtensionAPI) {
     description: "内部命令：由飞书 /new 触发，切换到全新会话",
     handler: async (_args: string, cmdCtx: ExtensionCommandContext) => {
       const req = pendingNewSession;
-      console.warn("[feishu/fsnew] 处理器进入");
+      console.warn(`[feishu/fsnew ${new Date().toISOString().slice(11,23)}] 处理器进入`);
       // 关键：必须脱离 prompt() 调用栈后再切换。在未决的 prompt 上做会话替换
       // 会形成循环等待（等待自身所在的栈退绕），表现为 newSession 永不返回。
       setTimeout(() => {
         void (async () => {
+          console.warn(`[feishu/fsnew ${new Date().toISOString().slice(11,23)}] 延迟体启动，调用 cmdCtx.newSession()`);
           try {
             const result = await cmdCtx.newSession();
             console.warn(`[feishu/fsnew] newSession 返回 cancelled=${result.cancelled}`);
