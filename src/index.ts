@@ -912,27 +912,41 @@ export default function (pi: ExtensionAPI) {
     handler: async (_args: string, cmdCtx: ExtensionCommandContext) => {
       const req = pendingNewSession;
       console.warn("[feishu/fsnew] 处理器进入");
-      const result = await cmdCtx.newSession();
-      console.warn(`[feishu/fsnew] newSession 返回 cancelled=${result.cancelled}`);
-      if (result.cancelled) {
-        if (req) await client?.sendMessage(req.chatId, "⚠️ 会话切换被取消，原会话保留。", req.userMsgId).catch(() => {});
-        pendingNewSession = null;
-        return;
-      }
-      if (!req) return;
-      try {
-        await client?.sendMessage(req.chatId, "✅ 已进入全新会话（历史已彻底清空）。", req.userMsgId);
-      } catch (err) {
-        console.warn("[feishu/fsnew] 回执失败（reply 路径）:", err);
-        try {
-          await client?.sendMessage(req.chatId, "✅ 已进入全新会话（历史已彻底清空）。");
-          pendingNewSession = null;
-        } catch (err2) {
-          console.error("[feishu/fsnew] 兜底发送仍失败:", err2);
-        }
-        return;
-      }
-      pendingNewSession = null;
+      // 关键：必须脱离 prompt() 调用栈后再切换。在未决的 prompt 上做会话替换
+      // 会形成循环等待（等待自身所在的栈退绕），表现为 newSession 永不返回。
+      setTimeout(() => {
+        void (async () => {
+          try {
+            const result = await cmdCtx.newSession();
+            console.warn(`[feishu/fsnew] newSession 返回 cancelled=${result.cancelled}`);
+            if (result.cancelled) {
+              if (req) await client?.sendMessage(req.chatId, "⚠️ 会话切换被取消，原会话保留。", req.userMsgId).catch(() => {});
+              pendingNewSession = null;
+              return;
+            }
+            if (!req) return;
+            try {
+              await client?.sendMessage(req.chatId, "✅ 已进入全新会话（历史已彻底清空）。", req.userMsgId);
+            } catch (err) {
+              console.warn("[feishu/fsnew] 回执失败（reply 路径）:", err);
+              try {
+                await client?.sendMessage(req.chatId, "✅ 已进入全新会话（历史已彻底清空）。");
+                pendingNewSession = null;
+              } catch (err2) {
+                console.error("[feishu/fsnew] 兜底发送仍失败:", err2);
+              }
+              return;
+            }
+            pendingNewSession = null;
+          } catch (err) {
+            console.error("[feishu/fsnew] newSession 抛错:", err);
+            if (req) {
+              await client?.sendMessage(req.chatId, `⚠️ 会话切换失败：${err}`, req.userMsgId).catch(() => {});
+              pendingNewSession = null;
+            }
+          }
+        })();
+      }, 25);
     },
   });
 
