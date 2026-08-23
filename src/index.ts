@@ -443,6 +443,7 @@ export default function (pi: ExtensionAPI) {
           options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
         ) => void;
         sendWithCommandRouting("/fsnew", { expandPromptTemplates: true });
+        console.warn("[feishu/new] 路由调用已同步返回");
         await client?.sendMessage(chatId, "正在切换到全新会话…", msgId);
 
         const switchReq = pendingNewSession;
@@ -910,7 +911,9 @@ export default function (pi: ExtensionAPI) {
     description: "内部命令：由飞书 /new 触发，切换到全新会话",
     handler: async (_args: string, cmdCtx: ExtensionCommandContext) => {
       const req = pendingNewSession;
+      console.warn("[feishu/fsnew] 处理器进入");
       const result = await cmdCtx.newSession();
+      console.warn(`[feishu/fsnew] newSession 返回 cancelled=${result.cancelled}`);
       if (result.cancelled) {
         if (req) await client?.sendMessage(req.chatId, "⚠️ 会话切换被取消，原会话保留。", req.userMsgId).catch(() => {});
         pendingNewSession = null;
