@@ -3,7 +3,7 @@
   "version": "1.1.5",
   "description": "Pi extension: remote control Pi via Feishu (飞书) Bot API — WebSocket chat bridge using official Lark SDK",
   "type": "module",
-  "main": "src/index.ts",
+  "main": "index.ts",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -24,13 +24,14 @@
     "websocket"
   ],
   "files": [
+    "index.ts",
     "src/index.ts",
     "src/feishu-client.ts",
     "src/types.ts"
   ],
   "pi": {
     "extensions": [
-      "./src/index.ts"
+      "./index.ts"
     ]
   },
   "scripts": {
