@@ -444,6 +444,15 @@ export default function (pi: ExtensionAPI) {
         ) => void;
         sendWithCommandRouting("/fsnew", { expandPromptTemplates: true });
         await client?.sendMessage(chatId, "正在切换到全新会话…", msgId);
+
+        const switchReq = pendingNewSession;
+        const switchTimeout = setTimeout(() => {
+          if (pendingNewSession === switchReq) {
+            console.error("[feishu/new] 15秒未收到 fsnew 回执，处理器可能未执行或通知链路故障");
+            client?.sendMessage(chatId, "⚠️ 会话切换回执超时。切换本身可能已成功（可用任意消息验证上下文是否清空），请把终端日志发给我排查。", msgId).catch(() => {});
+          }
+        }, 15000);
+        if (switchTimeout.unref) switchTimeout.unref();
         break;
       }
 
@@ -901,11 +910,26 @@ export default function (pi: ExtensionAPI) {
     description: "内部命令：由飞书 /new 触发，切换到全新会话",
     handler: async (_args: string, cmdCtx: ExtensionCommandContext) => {
       const req = pendingNewSession;
-      pendingNewSession = null;
       const result = await cmdCtx.newSession();
-      if (!result.cancelled && req) {
-        await client?.sendMessage(req.chatId, "✅ 已进入全新会话（历史已彻底清空）。", req.userMsgId).catch(() => {});
+      if (result.cancelled) {
+        if (req) await client?.sendMessage(req.chatId, "⚠️ 会话切换被取消，原会话保留。", req.userMsgId).catch(() => {});
+        pendingNewSession = null;
+        return;
       }
+      if (!req) return;
+      try {
+        await client?.sendMessage(req.chatId, "✅ 已进入全新会话（历史已彻底清空）。", req.userMsgId);
+      } catch (err) {
+        console.warn("[feishu/fsnew] 回执失败（reply 路径）:", err);
+        try {
+          await client?.sendMessage(req.chatId, "✅ 已进入全新会话（历史已彻底清空）。");
+          pendingNewSession = null;
+        } catch (err2) {
+          console.error("[feishu/fsnew] 兜底发送仍失败:", err2);
+        }
+        return;
+      }
+      pendingNewSession = null;
     },
   });
 
