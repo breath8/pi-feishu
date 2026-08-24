@@ -47,9 +47,6 @@ import type { FeishuConfig } from "./types.js";
 
 // ─── 常量 ─────────────────────────────────────────────
 
-/** 飞书 post 消息单条最大字符数（约 4000） */
-const MAX_TEXT_CHUNK = 4000;
-
 /** 工具名到友好名称的映射 */
 const TOOL_DISPLAY_NAMES: Record<string, string> = {
   bash: "Shell",
@@ -730,10 +727,9 @@ export default function (pi: ExtensionAPI) {
 
     if (hasToolCalls) {
       const processed = downgradeHeadings(textContent);
-      const chunks = chunkText(processed, MAX_TEXT_CHUNK);
-      for (const chunk of chunks) {
-        client.sendMessage(state.chatId, chunk, state.userMsgId).catch(() => {});
-      }
+      client.sendMessage(state.chatId, processed, state.userMsgId).catch((err) => {
+        console.warn("[feishu] turn_end 发送中间文本失败:", err);
+      });
     }
 
     flashStatus(`飞书: 📤 推送中 (${textContent.length}字)`);
@@ -770,10 +766,9 @@ export default function (pi: ExtensionAPI) {
       }
     } else {
       const processed = downgradeHeadings(finalText);
-      const chunks = chunkText(processed, MAX_TEXT_CHUNK);
-      for (const chunk of chunks) {
-        client.sendMessage(chatId, chunk).catch(() => {});
-      }
+      client.sendMessage(chatId, processed).catch((err) => {
+        console.warn("[feishu] agent_end 发送最终回复失败:", err);
+      });
     }
 
     state.toolEntries.forEach((e) => {
@@ -1477,33 +1472,5 @@ export default function (pi: ExtensionAPI) {
         }
       }
     }, 3000);
-  }
-
-  function chunkText(text: string, maxLen: number): string[] {
-    if (text.length <= maxLen) return [text];
-
-    const chunks: string[] = [];
-    let remaining = text;
-
-    while (remaining.length > 0) {
-      if (remaining.length <= maxLen) {
-        chunks.push(remaining);
-        break;
-      }
-
-      let splitPos = remaining.lastIndexOf("\n", maxLen);
-      if (splitPos <= 0) {
-        splitPos = remaining.lastIndexOf(" ", maxLen);
-      }
-      if (splitPos <= 0) {
-        chunks.push(remaining.substring(0, maxLen));
-        remaining = remaining.substring(maxLen);
-      } else {
-        chunks.push(remaining.substring(0, splitPos + 1));
-        remaining = remaining.substring(splitPos + 1);
-      }
-    }
-
-    return chunks;
   }
 }

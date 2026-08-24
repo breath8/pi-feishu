@@ -41,6 +41,8 @@ const MEDIA_TTL_MS = 24 * 60 * 60 * 1000;
 /** 飞书 Reaction emoji 类型 */
 const REACTION_TYPING = "Typing";
 const REACTION_CROSS_MARK = "CrossMark";
+/** 单条卡片/消息最大文本长度（4000 字符） */
+const MAX_TEXT_CHUNK = 4000;
 
 // ─── 飞书事件类型 ───────────────────────────────────────
 
@@ -274,12 +276,17 @@ export class FeishuClient {
 
   // ─── 消息发送 ──────────────────────────────────────────
 
-  /** 发送文本消息到飞书（回复模式优先，使用 interactive 卡片格式） */
+  /** 发送文本消息到飞书（回复模式优先，自动分段，使用 interactive 卡片格式，保证严格按序发送） */
   async sendMessage(chatId: string, text: string, replyToMsgId?: string): Promise<void> {
-    const cards = FeishuClient.buildTextCardsWithTable(text);
+    const chunks = FeishuClient.chunkText(text, MAX_TEXT_CHUNK);
+    const allCards: Record<string, unknown>[] = [];
+    for (const chunk of chunks) {
+      const cards = FeishuClient.buildTextCardsWithTable(chunk);
+      allCards.push(...cards);
+    }
 
-    for (let i = 0; i < cards.length; i++) {
-      const card = cards[i];
+    for (let i = 0; i < allCards.length; i++) {
+      const card = allCards[i];
       const isFirst = i === 0;
       const content = JSON.stringify(card);
 
@@ -306,9 +313,13 @@ export class FeishuClient {
           throw err;
         }
       }
+
+      if (i < allCards.length - 1) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
     }
 
-    _log(`Message sent to ${chatId}${replyToMsgId ? ` (reply to ${replyToMsgId})` : ""} (${cards.length} cards)`);
+    _log(`Message sent to ${chatId}${replyToMsgId ? ` (reply to ${replyToMsgId})` : ""} (${allCards.length} cards)`);
   }
 
   /** 发送交互卡片消息 */
@@ -732,8 +743,193 @@ export class FeishuClient {
   /** 构建纯文本卡片（用于普通消息回复，支持完整 Markdown） */
   static buildTextCard(text: string): Record<string, unknown> {
     return FeishuClient.buildCard([
-      { tag: "markdown", content: FeishuClient.safeText(text) },
+      { tag: "markdown", content: text },
     ]);
+  }
+
+  static chunkText(text: string, maxLen: number = MAX_TEXT_CHUNK): string[] {
+    if (text.length <= maxLen) return [text];
+
+    type BlockType = "paragraph" | "code_block" | "table";
+    interface ContentBlock {
+      type: BlockType;
+      content: string;
+      fence?: string;
+    }
+
+    const lines = text.split("\n");
+    const blocks: ContentBlock[] = [];
+
+    let i = 0;
+    while (i < lines.length) {
+      const line = lines[i];
+
+      const fenceMatch = line.match(/^(\s*)(`{3,}|~{3,})(.*)$/);
+      if (fenceMatch) {
+        const fenceChar = fenceMatch[2][0];
+        const fenceLen = fenceMatch[2].length;
+        const codeLines = [line];
+        i++;
+        while (i < lines.length) {
+          const cur = lines[i];
+          codeLines.push(cur);
+          const closeMatch = cur.match(/^(\s*)(`{3,}|~{3,})\s*$/);
+          if (closeMatch && closeMatch[2][0] === fenceChar && closeMatch[2].length >= fenceLen) {
+            i++;
+            break;
+          }
+          i++;
+        }
+        blocks.push({
+          type: "code_block",
+          content: codeLines.join("\n"),
+          fence: fenceMatch[2] + fenceMatch[3],
+        });
+        continue;
+      }
+
+      const isTableLine = line.includes("|") && line.trim().startsWith("|");
+      if (isTableLine) {
+        const tableLines = [line];
+        i++;
+        while (i < lines.length) {
+          const cur = lines[i];
+          if (cur.includes("|") && cur.trim().startsWith("|")) {
+            tableLines.push(cur);
+            i++;
+          } else {
+            break;
+          }
+        }
+        blocks.push({
+          type: "table",
+          content: tableLines.join("\n"),
+        });
+        continue;
+      }
+
+      const paraLines = [line];
+      i++;
+      while (i < lines.length) {
+        const cur = lines[i];
+        const isFence = /^(\s*)(`{3,}|~{3,})(.*)$/.test(cur);
+        const isTbl = cur.includes("|") && cur.trim().startsWith("|");
+        if (isFence || isTbl) {
+          break;
+        }
+        paraLines.push(cur);
+        i++;
+      }
+      blocks.push({
+        type: "paragraph",
+        content: paraLines.join("\n"),
+      });
+    }
+
+    const chunks: string[] = [];
+    let currentChunkParts: string[] = [];
+    let currentChunkLen = 0;
+
+    const flushCurrentChunk = () => {
+      if (currentChunkParts.length > 0) {
+        chunks.push(currentChunkParts.join("\n\n"));
+        currentChunkParts = [];
+        currentChunkLen = 0;
+      }
+    };
+
+    for (const block of blocks) {
+      const blockLen = block.content.length + (currentChunkParts.length > 0 ? 2 : 0);
+
+      if (currentChunkLen + blockLen <= maxLen) {
+        currentChunkParts.push(block.content);
+        currentChunkLen += blockLen;
+        continue;
+      }
+
+      if (currentChunkParts.length > 0) {
+        flushCurrentChunk();
+      }
+
+      if (block.content.length <= maxLen) {
+        currentChunkParts.push(block.content);
+        currentChunkLen = block.content.length;
+        continue;
+      }
+
+      if (block.type === "code_block") {
+        const bLines = block.content.split("\n");
+        const openFence = bLines[0];
+        const closeFence = bLines.length > 1 && /^(\s*)(`{3,}|~{3,})\s*$/.test(bLines[bLines.length - 1])
+          ? bLines[bLines.length - 1]
+          : "```";
+        const innerLines = bLines.slice(1, bLines.length - 1);
+
+        let subLines: string[] = [];
+        let subLen = openFence.length + 1 + closeFence.length;
+
+        for (const codeLine of innerLines) {
+          const lLen = codeLine.length + 1;
+          if (subLen + lLen > maxLen && subLines.length > 0) {
+            chunks.push([openFence, ...subLines, closeFence].join("\n"));
+            subLines = [];
+            subLen = openFence.length + 1 + closeFence.length;
+          }
+          subLines.push(codeLine);
+          subLen += lLen;
+        }
+
+        if (subLines.length > 0) {
+          chunks.push([openFence, ...subLines, closeFence].join("\n"));
+        }
+      } else if (block.type === "table") {
+        const tLines = block.content.split("\n");
+        const headerLines = tLines.slice(0, 2);
+        const headerStr = headerLines.join("\n");
+        const dataLines = tLines.slice(2);
+
+        let subTableRows: string[] = [];
+        let subTableLen = headerStr.length + 1;
+
+        for (const dLine of dataLines) {
+          const lLen = dLine.length + 1;
+          if (subTableLen + lLen > maxLen && subTableRows.length > 0) {
+            chunks.push([headerStr, ...subTableRows].join("\n"));
+            subTableRows = [];
+            subTableLen = headerStr.length + 1;
+          }
+          subTableRows.push(dLine);
+          subTableLen += lLen;
+        }
+
+        if (subTableRows.length > 0) {
+          chunks.push([headerStr, ...subTableRows].join("\n"));
+        }
+      } else {
+        const pLines = block.content.split("\n");
+        let subParaLines: string[] = [];
+        let subParaLen = 0;
+
+        for (const pl of pLines) {
+          const lLen = pl.length + 1;
+          if (subParaLen + lLen > maxLen && subParaLines.length > 0) {
+            chunks.push(subParaLines.join("\n"));
+            subParaLines = [];
+            subParaLen = 0;
+          }
+          subParaLines.push(pl);
+          subParaLen += lLen;
+        }
+
+        if (subParaLines.length > 0) {
+          currentChunkParts.push(subParaLines.join("\n"));
+          currentChunkLen = subParaLines.join("\n").length;
+        }
+      }
+    }
+
+    flushCurrentChunk();
+    return chunks;
   }
 
   static buildTextCardsWithTable(text: string): Record<string, unknown>[] {
