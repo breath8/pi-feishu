@@ -129,7 +129,9 @@ Bot:                                    [最终回复]
 | `tool_execution_end` | 更新进度卡片（标记完成/失败） |
 | `turn_end`（含工具调用） | 发送中间文本（回复模式） |
 | `turn_end`（纯文本） | 发送最终回复（新消息） |
-| `agent_end` | 移除 Typing Reaction |
+| `turn_end`（LLM 错误） | 仅记录错误，不推送（避免可重试错误如 429 的误导性报错） |
+| `agent_end`（正常完成） | 发送最终回复 + 移除 Typing Reaction |
+| `agent_end`（本轮出现过错误） | 延迟收尾：等待 Pi 空闲后一次性发送结果或错误回执（兼容自动重试场景） |
 
 ### 注册的 Pi 工具
 
