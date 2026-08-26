@@ -126,6 +126,8 @@ interface ChatState {
   progressCreating: boolean;
   toolEntries: ToolEntry[];
   generation: number;
+  /** turn_end 已实时推送的中间文本轮数，agent_end 聚合时据此跳过已发送部分 */
+  intermediatesSent: number;
 }
 
 // ─── 扩展入口 ───────────────────────────────────────────
@@ -405,6 +407,7 @@ export default function (pi: ExtensionAPI) {
       progressCreating: false,
       toolEntries: [],
       generation: gen,
+      intermediatesSent: 0,
     });
 
     // 添加 Typing Reaction
@@ -727,6 +730,9 @@ export default function (pi: ExtensionAPI) {
 
     if (hasToolCalls) {
       const processed = downgradeHeadings(textContent);
+      // 同步递增（而非 .then 回调）：agent_end 可能在中间文本 HTTP 请求仍在途时触发，
+      // 若按成功回调计数会导致少计而重复发送
+      state.intermediatesSent++;
       client.sendMessage(state.chatId, processed, state.userMsgId).catch((err) => {
         console.warn("[feishu] turn_end 发送中间文本失败:", err);
       });
@@ -757,7 +763,7 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    const finalText = allAssistantTexts.join("\n");
+    const finalText = allAssistantTexts.slice(state.intermediatesSent).join("\n");
 
     if (!finalText) {
       const lastMsg = event.messages?.[event.messages.length - 1] as any;
