@@ -135,6 +135,7 @@ interface ChatState {
 // ─── 扩展入口 ───────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+  console.log("[feishu] 扩展初始化开始");
   let config: FeishuConfig = loadConfig();
   let ctxRef: ExtensionContext | null = null;
   // 跨实例共享飞书客户端，避免新会话重建时旧连接丢失
@@ -218,10 +219,12 @@ export default function (pi: ExtensionAPI) {
     if (existing) clearTimeout(existing);
 
     const timer = setTimeout(() => {
+      console.log("[feishu] 看门狗触发，chatId:", chatId);
       taskWatchdogTimers.delete(chatId);
 
       // Pi 仍在工作（长工具执行/长文本生成）→ 顺延看门狗，避免误杀活跃任务
       if (!isCtxIdle()) {
+        console.log("[feishu] 看门狗: Pi 仍在工作，顺延看门狗");
         const used = watchdogExtensionCounts.get(chatId) ?? 0;
         if (used >= WATCHDOG_MAX_EXTENSIONS) {
           watchdogExtensionCounts.delete(chatId);
@@ -719,21 +722,33 @@ export default function (pi: ExtensionAPI) {
   // ─── turn_end → 发送中间/最终文本 ─────────────────────
 
   pi.on("turn_end", (event: TurnEndEvent) => {
-    if (!client || client.getStatus() !== "connected") return;
+    console.log("[feishu] turn_end 事件触发，message:", event.message?.role);
+    if (!client || client.getStatus() !== "connected") {
+      console.log("[feishu] turn_end: 客户端未连接，跳过");
+      return;
+    }
     const state = findActiveState();
-    if (!state) return;
+    if (!state) {
+      console.log("[feishu] turn_end: 未找到活跃状态，跳过");
+      return;
+    }
 
-    if (state.generation !== chatGeneration.get(state.chatId)) return;
+    if (state.generation !== chatGeneration.get(state.chatId)) {
+      console.log("[feishu] turn_end: generation 不匹配，跳过");
+      return;
+    }
 
     resetTaskWatchdog(state.chatId);
 
     const message = event.message;
     if (!message || message.role !== "assistant") return;
 
-    if (message.stopReason === "error") {
+    const assistantMsg = message as { stopReason?: string; errorMessage?: string };
+    if (assistantMsg.stopReason === "error") {
       // 仅记录不上报：可重试错误（429 等）Pi 会自动重试，此时推送「LLM 错误」属误导性噪音；
       // 是否补发由收尾阶段裁决（重试成功则静默恢复，彻底失败才补发）
-      state.lastError = message.errorMessage ?? "LLM 返回了未知错误";
+      state.lastError = assistantMsg.errorMessage ?? "LLM 返回了未知错误";
+      console.log("[feishu] turn_end: 记录错误:", state.lastError);
       flashStatus("飞书: ⚠️ LLM 错误");
 
       // 不清理状态：Pi 可能仍在继续处理，等 agent_end 完成清理
@@ -761,16 +776,29 @@ export default function (pi: ExtensionAPI) {
   // ─── agent_end → 清理 + 处理下一条排队消息 ──────────
 
   pi.on("agent_end", (event: AgentEndEvent) => {
-    if (!client || client.getStatus() !== "connected") return;
+    console.log("[feishu] agent_end 事件触发，messages:", event.messages?.length ?? 0);
+    if (!client || client.getStatus() !== "connected") {
+      console.log("[feishu] agent_end: 客户端未连接，跳过");
+      return;
+    }
     const state = findActiveState();
-    if (!state) return;
+    if (!state) {
+      console.log("[feishu] agent_end: 未找到活跃状态，跳过");
+      return;
+    }
 
-    if (state.generation !== chatGeneration.get(state.chatId)) return;
+    if (state.generation !== chatGeneration.get(state.chatId)) {
+      console.log("[feishu] agent_end: generation 不匹配，跳过");
+      return;
+    }
 
     // 前向防御：未来运行时若在 agent_end 上透传 willRetry=true（失败尝试的假结束）则直接跳过。
     // 当前版本已实测不透传该字段，此分支不会命中；实际防线是下方 lastError 触发的「保留状态」策略
     const willRetry = (event as { willRetry?: unknown }).willRetry;
-    if (willRetry === true) return;
+    if (willRetry === true) {
+      console.log("[feishu] agent_end: willRetry=true，跳过");
+      return;
+    }
 
     const allAssistantTexts: string[] = [];
 
@@ -805,6 +833,7 @@ export default function (pi: ExtensionAPI) {
 
   /** 收尾：推送最终文本或错误回执 + 清理桥接状态、看门狗 + 放行排队消息 */
   function finalizeChatTask(state: ChatState, processedFinalText: string, lastStopWasError: boolean): void {
+    console.log("[feishu] finalizeChatTask 被调用，finalText长度:", processedFinalText?.length ?? 0, "lastStopWasError:", lastStopWasError);
     const chatId = state.chatId;
     if (!client || client.getStatus() !== "connected") {
       // 断连时无法推送，但仍须释放桥接资源：延迟收尾窗口可达分钟级，
@@ -1395,6 +1424,8 @@ export default function (pi: ExtensionAPI) {
     for (const timer of taskWatchdogTimers.values()) clearTimeout(timer);
     taskWatchdogTimers.clear();
   });
+
+  console.log("[feishu] 扩展初始化完成，所有事件处理器已注册");
 
   // ─── 工具函数 ────────────────────────────────────────
 
