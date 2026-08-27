@@ -201,13 +201,13 @@ export default function (pi: ExtensionAPI) {
   const WATCHDOG_MAX_EXTENSIONS = 12;
 
   /**
-   * agent_end 延迟收尾探针：Pi 对可重试错误（429 等）会在重试裁决前就向扩展发出
-   * agent_end（且不透传 willRetry），若立即收尾会删掉桥接状态，导致重试成功后的
-   * 结果永远无法推送。出现过错误的 run 改为轮询 ctx.isIdle()，真正空闲后才收尾。
+   * 出错 run 的收尾策略：Pi 对可重试错误（429 等）会在重试裁决前就向扩展发出
+   * agent_end（且不透传 willRetry），若在此假结束上立即收尾会删掉桥接状态，
+   * 导致重试成功后的结果永远无法推送。因此出错 run 不在此收尾、不删除状态，
+   * 保留到真实的「最终 agent_end」（重试成功）收尾；若重试彻底失败且无后续
+   * agent_end，由 5 分钟任务看门狗兜底回执错误并清理。
    */
-  const pendingFinalizes: Map<string, { timer: ReturnType<typeof setTimeout> }> = new Map();
-  const FINALIZE_PROBE_MS = 1500;
-  const FINALIZE_MAX_WAIT_MS = 10 * 60 * 1000;
+
 
   /** 飞书 /new → 内部命令 fsnew 的待回执请求（记录发起聊天，成功后定向通知） */
   let pendingNewSession: { chatId: string; userMsgId: string } | null = null;
@@ -237,14 +237,14 @@ export default function (pi: ExtensionAPI) {
       const state = chatStates.get(chatId);
       if (!state) return;
 
-      client?.sendMessage(chatId, "任务超时：长时间无响应，已自动清理。").catch(() => {});
+      // 出错 run 彻底卡死（重试耗尽/无后续 agent_end）：回执真实错误，而非泛化超时
+      if (state.lastError) {
+        client?.sendMessage(chatId, `LLM 错误: ${state.lastError.slice(0, 200)}`, state.userMsgId).catch(() => {});
+      } else {
+        client?.sendMessage(chatId, "任务超时：长时间无响应，已自动清理。").catch(() => {});
+      }
       client?.stopTyping(chatId, false).catch(() => {});
       chatStates.delete(chatId);
-      const staleFinalize = pendingFinalizes.get(chatId);
-      if (staleFinalize) {
-        clearTimeout(staleFinalize.timer);
-        pendingFinalizes.delete(chatId);
-      }
       chatGeneration.set(chatId, (chatGeneration.get(chatId) ?? 0) + 1);
       globalQueue.processing = false;
       flushAllQueues();
@@ -446,8 +446,6 @@ export default function (pi: ExtensionAPI) {
     }
     for (const t of taskWatchdogTimers.values()) clearTimeout(t);
     taskWatchdogTimers.clear();
-    for (const p of pendingFinalizes.values()) clearTimeout(p.timer);
-    pendingFinalizes.clear();
     watchdogExtensionCounts.clear();
     globalQueue.items = [];
     globalQueue.processing = false;
@@ -531,11 +529,6 @@ export default function (pi: ExtensionAPI) {
         if (state) {
           client?.stopTyping(chatId, false).catch(() => {});
           chatStates.delete(chatId);
-          const staleFinalize = pendingFinalizes.get(chatId);
-          if (staleFinalize) {
-            clearTimeout(staleFinalize.timer);
-            pendingFinalizes.delete(chatId);
-          }
           chatGeneration.set(chatId, (chatGeneration.get(chatId) ?? 0) + 1);
           const watchdog = taskWatchdogTimers.get(chatId);
           if (watchdog) {
@@ -775,7 +768,7 @@ export default function (pi: ExtensionAPI) {
     if (state.generation !== chatGeneration.get(state.chatId)) return;
 
     // 前向防御：未来运行时若在 agent_end 上透传 willRetry=true（失败尝试的假结束）则直接跳过。
-    // 当前版本已实测不透传该字段，此分支不会命中；实际防线是下方 lastError 触发的空闲探针
+    // 当前版本已实测不透传该字段，此分支不会命中；实际防线是下方 lastError 触发的「保留状态」策略
     const willRetry = (event as { willRetry?: unknown }).willRetry;
     if (willRetry === true) return;
 
@@ -805,8 +798,9 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    // 出现过错误的 run：agent_end 可能只是重试前的假结束，转空闲探针延迟收尾
-    scheduleAgentFinalize(state, finalText, lastStopWasError);
+    // 出现过错误的 run：当前 agent_end 可能只是重试前的假结束。
+    // 不在此收尾、不删除状态——保留到真实最终 agent_end 收尾；看门狗兜底彻底失败。
+    return;
   });
 
   /** 收尾：推送最终文本或错误回执 + 清理桥接状态、看门狗 + 放行排队消息 */
@@ -830,7 +824,7 @@ export default function (pi: ExtensionAPI) {
         console.warn("[feishu] 发送最终回复失败:", err);
       });
     } else if (state.lastError) {
-      client.sendMessage(chatId, `LLM 错误: ${state.lastError}`, state.userMsgId).catch((err) => {
+      client.sendMessage(chatId, `LLM 错误: ${state.lastError.slice(0, 200)}`, state.userMsgId).catch((err) => {
         console.warn("[feishu] 发送错误回执失败:", err);
       });
     } else if (lastStopWasError) {
@@ -858,38 +852,6 @@ export default function (pi: ExtensionAPI) {
     globalQueue.processing = false;
     flushAllQueues();
     flashStatus("飞书: ✅ 完成");
-  }
-
-  /**
-   * 出错 run 的延迟收尾：轮询 ctx.isIdle() 直到 Pi 真正空闲。
-   * 重试退避期间会话保持忙碌（waitForRetry 挂起），探针持续顺延，
-   * 桥接状态得以存活，重试成功的所有后续推送不受影响。
-   */
-  function scheduleAgentFinalize(state: ChatState, processedFinalText: string, lastStopWasError: boolean): void {
-    const chatId = state.chatId;
-    const pending = pendingFinalizes.get(chatId);
-    if (pending) clearTimeout(pending.timer);
-
-    const startedAt = Date.now();
-    const attempt = () => {
-      pendingFinalizes.delete(chatId);
-      // 状态已被 /stop、/new 或看门狗接管 → 本轮收尾作废
-      if (chatStates.get(chatId) !== state) return;
-
-      if (!isCtxIdle()) {
-        if (Date.now() - startedAt >= FINALIZE_MAX_WAIT_MS) {
-          finalizeChatTask(state, processedFinalText, lastStopWasError);
-          return;
-        }
-        const t = setTimeout(attempt, FINALIZE_PROBE_MS);
-        if (t.unref) t.unref();
-        pendingFinalizes.set(chatId, { timer: t });
-        return;
-      }
-
-      finalizeChatTask(state, processedFinalText, lastStopWasError);
-    };
-    attempt();
   }
 
   // ─── Pi 空闲时刷新所有队列 ─────────────────────────────
@@ -1432,8 +1394,6 @@ export default function (pi: ExtensionAPI) {
     progressUpdateTimers.clear();
     for (const timer of taskWatchdogTimers.values()) clearTimeout(timer);
     taskWatchdogTimers.clear();
-    for (const p of pendingFinalizes.values()) clearTimeout(p.timer);
-    pendingFinalizes.clear();
   });
 
   // ─── 工具函数 ────────────────────────────────────────

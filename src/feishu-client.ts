@@ -932,15 +932,108 @@ export class FeishuClient {
     return chunks;
   }
 
-  static buildTextCardsWithTable(text: string): Record<string, unknown>[] {
-    const hasTable = FeishuClient.detectMarkdownTable(text);
-    
-    if (!hasTable) {
-      return [FeishuClient.buildTextCard(text)];
-    }
+  /** 围栏语言别名 → 飞书 markdown 代码围栏的语言提示（仅用于 ```lang 标签，非独立元素） */
+  private static readonly CODE_LANG_HINT: Record<string, string> = {
+    c: "c", cpp: "cpp", "c++": "cpp", cc: "cpp", cxx: "cpp", hpp: "cpp",
+    "c#": "csharp", csharp: "csharp", cs: "csharp",
+    js: "javascript", javascript: "javascript",
+    ts: "typescript", typescript: "typescript",
+    py: "python", python: "python",
+    sh: "bash", bash: "bash", shell: "bash", zsh: "bash",
+    yml: "yaml", yaml: "yaml",
+    java: "java", go: "go", rust: "rust", json: "json",
+    html: "html", xml: "xml", sql: "sql", dockerfile: "dockerfile",
+    markdown: "markdown", makefile: "makefile", lua: "lua", ruby: "ruby",
+    php: "php", swift: "swift", kotlin: "kotlin", scala: "scala", r: "r",
+    protobuf: "protobuf", toml: "toml", ini: "ini",
+  };
 
+  private static normalizeCodeLang(lang: string): string {
+    const l = lang.trim().toLowerCase();
+    if (!l) return "";
+    return FeishuClient.CODE_LANG_HINT[l] ?? l;
+  }
+
+  /**
+   * 将文本拆分为 文本 / 代码块 / 表格 三种语义片段。
+   * 代码块还原为飞书 markdown 原生支持的围栏（```lang），围栏行置于行首，
+   * 避免嵌套缩进导致飞书不识别；绝不使用独立 `code` 标签（该卡片类型不支持，会 400/230099）。
+   */
+  private static parseContentBlocks(text: string): Array<
+    { type: "text"; content: string } |
+    { type: "code"; content: string } |
+    { type: "table"; content: string }
+  > {
+    const parts: Array<
+      { type: "text"; content: string } |
+      { type: "code"; content: string } |
+      { type: "table"; content: string }
+    > = [];
+    const lines = text.split("\n");
+    let i = 0;
+    while (i < lines.length) {
+      const line = lines[i];
+      const fenceMatch = line.match(/^\s*(`{3,}|~{3,})(.*)$/);
+      if (fenceMatch) {
+        const fenceChar = fenceMatch[1][0];
+        const fenceLen = fenceMatch[1].length;
+        const langHint = fenceMatch[2].trim();
+        const codeLines = [line];
+        i++;
+        while (i < lines.length) {
+          const cur = lines[i];
+          codeLines.push(cur);
+          const closeMatch = cur.match(/^\s*(`{3,}|~{3,})\s*$/);
+          if (closeMatch && closeMatch[1][0] === fenceChar && closeMatch[1].length >= fenceLen) {
+            i++;
+            break;
+          }
+          i++;
+        }
+        const inner = codeLines.slice(1, codeLines.length - 1).join("\n");
+        const lang = FeishuClient.normalizeCodeLang(langHint);
+        const fence = fenceChar.repeat(Math.max(fenceLen, 3));
+        // 围栏置于行首，确保飞书 markdown 将其识别为代码块（嵌套缩进的围栏不会被渲染）
+        const fenced = lang ? `${fence}${lang}\n${inner}\n${fence}` : `${fence}\n${inner}\n${fence}`;
+        parts.push({ type: "code", content: fenced });
+        continue;
+      }
+
+      const isTableLine = line.includes("|") && line.trim().startsWith("|");
+      if (isTableLine) {
+        const tableLines = [line];
+        i++;
+        while (i < lines.length) {
+          const cur = lines[i];
+          if (cur.includes("|") && cur.trim().startsWith("|")) {
+            tableLines.push(cur);
+            i++;
+          } else {
+            break;
+          }
+        }
+        parts.push({ type: "table", content: tableLines.join("\n") });
+        continue;
+      }
+
+      const paraLines = [line];
+      i++;
+      while (i < lines.length) {
+        const cur = lines[i];
+        const isFence = /^\s*(`{3,}|~{3,})/.test(cur);
+        const isTbl = cur.includes("|") && cur.trim().startsWith("|");
+        if (isFence || isTbl) break;
+        paraLines.push(cur);
+        i++;
+      }
+      parts.push({ type: "text", content: paraLines.join("\n") });
+    }
+    return parts;
+  }
+
+  static buildTextCardsWithTable(text: string): Record<string, unknown>[] {
+    const parts = FeishuClient.parseContentBlocks(text);
     const MAX_TABLES_PER_CARD = 5;
-    const parts = FeishuClient.splitTextAndTables(text);
     const cards: Record<string, unknown>[] = [];
     let currentElements: Record<string, unknown>[] = [];
     let tableCount = 0;
@@ -948,6 +1041,9 @@ export class FeishuClient {
     for (const part of parts) {
       if (part.type === "text" && part.content.trim()) {
         currentElements.push({ tag: "markdown", content: part.content.trim() });
+      } else if (part.type === "code") {
+        // 代码块以 markdown 原生围栏渲染（飞书卡片不支持独立 code 标签，会 400/230099）
+        currentElements.push({ tag: "markdown", content: part.content });
       } else if (part.type === "table") {
         if (tableCount >= MAX_TABLES_PER_CARD) {
           if (currentElements.length > 0) {
@@ -975,59 +1071,6 @@ export class FeishuClient {
     }
 
     return cards;
-  }
-
-  private static detectMarkdownTable(text: string): boolean {
-    const lines = text.split("\n");
-    for (const line of lines) {
-      if (line.includes("|") && line.trim().startsWith("|")) {
-        const cells = line.split("|").filter(c => c.trim() !== "");
-        if (cells.length >= 2) {
-          return true;
-        }
-      }
-    }
-    return false;
-  }
-
-  private static splitTextAndTables(text: string): Array<{ type: "text" | "table"; content: string }> {
-    const parts: Array<{ type: "text" | "table"; content: string }> = [];
-    const lines = text.split("\n");
-    let currentText: string[] = [];
-    let tableLines: string[] = [];
-    let inTable = false;
-
-    for (const line of lines) {
-      const isTableLine = line.includes("|") && line.trim().startsWith("|");
-
-      if (isTableLine) {
-        if (!inTable) {
-          if (currentText.length > 0) {
-            parts.push({ type: "text", content: currentText.join("\n") });
-            currentText = [];
-          }
-          inTable = true;
-        }
-        tableLines.push(line);
-      } else {
-        if (inTable) {
-          if (tableLines.length > 0) {
-            parts.push({ type: "table", content: tableLines.join("\n") });
-            tableLines = [];
-          }
-          inTable = false;
-        }
-        currentText.push(line);
-      }
-    }
-
-    if (inTable && tableLines.length > 0) {
-      parts.push({ type: "table", content: tableLines.join("\n") });
-    } else if (currentText.length > 0) {
-      parts.push({ type: "text", content: currentText.join("\n") });
-    }
-
-    return parts;
   }
 
   private static buildFeishuTable(text: string): Record<string, unknown> | null {
