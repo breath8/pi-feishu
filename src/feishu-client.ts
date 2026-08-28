@@ -577,7 +577,10 @@ export class FeishuClient {
       // 解析消息内容和资源
       const { text, resources } = this.parseContentWithResources(msg.content, msg.message_type, msg.mentions);
 
-      if (!text && resources.length === 0) return;
+      if (!text && resources.length === 0) {
+        _warn(`Inbound 空文本丢弃: type=${msg.message_type} raw=${msg.content.substring(0, 200)}`);
+        return;
+      }
 
       _log(
         `Inbound: chatId=${chatId}, type=${chatType}, msgId=${messageId}, ` +
@@ -618,14 +621,14 @@ export class FeishuClient {
 
       case "post": {
         const parts: string[] = [];
-        const locale = parsed?.zh_cn ?? parsed?.en_us ?? parsed?.ja_jp;
+        const locale = parsed?.zh_cn ?? parsed?.en_us ?? parsed?.ja_jp ?? parsed;
         if (locale?.title) parts.push(locale.title);
         if (Array.isArray(locale?.content)) {
           for (const row of locale.content) {
             if (Array.isArray(row)) {
               for (const elem of row) {
                 if (elem?.tag === "text" && elem.text) parts.push(elem.text);
-                else if (elem?.tag === "a" && elem.text) parts.push(elem.text);
+                else if (elem?.tag === "a") parts.push(elem.text || (elem as any).href || "");
                 else if (elem?.tag === "md" && elem.text) parts.push(elem.text);
                 else if (elem?.tag === "at") parts.push(elem.user_id ?? "");
                 else if (elem?.tag === "img") {
@@ -634,11 +637,12 @@ export class FeishuClient {
                     resources.push({ type: "image", fileKey: elem.image_key });
                   }
                 }
+                else if ((elem as any).text) parts.push((elem as any).text);
               }
             }
           }
         }
-        text = parts.join("");
+        text = parts.join("\n");
         break;
       }
 
