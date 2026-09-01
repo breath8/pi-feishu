@@ -449,6 +449,30 @@ export class FeishuClient {
     }
   }
 
+  /** 上传 opus 音频到飞书，返回 file_key（语音条用） */
+  async uploadAudio(filePath: string, fileName: string, durationMs: number): Promise<string | null> {
+    try {
+      const { createReadStream } = await import("node:fs");
+      const stream = createReadStream(filePath);
+
+      const resp = await this.client.im.file.create({
+        data: {
+          file_type: "opus" as any,
+          file_name: fileName,
+          duration: durationMs,
+          file: stream as any,
+        },
+      });
+
+      const fileKey = resp?.file_key ?? null;
+      _log(`Audio uploaded: ${fileKey}`);
+      return fileKey;
+    } catch (err) {
+      _warn("Upload audio failed:", err);
+      return null;
+    }
+  }
+
   /** 上传文件到飞书，返回 file_key */
   async uploadFile(filePath: string, fileName: string, fileType: string = "stream"): Promise<string | null> {
     try {
@@ -503,6 +527,77 @@ export class FeishuClient {
       await this.client.im.message.create({
         params: { receive_id_type: "chat_id" },
         data: { receive_id: chatId, content, msg_type: "file" },
+      });
+    }
+  }
+
+  /** 发送语音消息（通过 file_key，msg_type: audio） */
+  async sendAudio(chatId: string, fileKey: string, replyToMsgId?: string): Promise<void> {
+    const content = JSON.stringify({ file_key: fileKey });
+
+    if (replyToMsgId) {
+      await this.client.im.message.reply({
+        path: { message_id: replyToMsgId },
+        data: { content, msg_type: "audio" },
+      });
+    } else {
+      await this.client.im.message.create({
+        params: { receive_id_type: "chat_id" },
+        data: { receive_id: chatId, content, msg_type: "audio" },
+      });
+    }
+  }
+
+  /** 上传 mp4 视频到飞书，返回 file_key（视频消息用）
+   *
+   * 官方限制（open.feishu.cn/document/server-docs/im-v1/file/create）：
+   *  - 文件大小不得超过 30MB，且不允许上传空文件
+   *  - 图片限制 10MB（错误码 234006: 文件:30M; 图片: 10M）
+   *  - file_type 需与消息类型匹配（错误码 230055）：上传 mp4 后需用 msg_type: media 发送
+   *  - duration 参数（毫秒）必须填充，否则视频/音频无法显示具体时长
+   *
+   *  @param durationMs 视频时长（毫秒），由 ffprobe 获取
+   */
+  async uploadVideo(filePath: string, fileName: string, durationMs: number): Promise<string | null> {
+    try {
+      const { createReadStream } = await import("node:fs");
+      const stream = createReadStream(filePath);
+
+      const resp = await this.client.im.file.create({
+        data: {
+          file_type: "mp4" as any,
+          file_name: fileName,
+          duration: durationMs,
+          file: stream as any,
+        },
+      });
+
+      const fileKey = resp?.file_key ?? null;
+      _log(`Video uploaded: ${fileKey}`);
+      return fileKey;
+    } catch (err) {
+      _warn("Upload video failed:", err);
+      return null;
+    }
+  }
+
+  /** 发送视频消息（通过 file_key，msg_type: media）
+   *  @param imageKey 可选视频封面图 key
+   */
+  async sendVideo(chatId: string, fileKey: string, replyToMsgId?: string, imageKey?: string): Promise<void> {
+    const content = JSON.stringify(
+      imageKey ? { file_key: fileKey, image_key: imageKey } : { file_key: fileKey },
+    );
+
+    if (replyToMsgId) {
+      await this.client.im.message.reply({
+        path: { message_id: replyToMsgId },
+        data: { content, msg_type: "media" },
+      });
+    } else {
+      await this.client.im.message.create({
+        params: { receive_id_type: "chat_id" },
+        data: { receive_id: chatId, content, msg_type: "media" },
       });
     }
   }

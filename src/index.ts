@@ -128,6 +128,8 @@ interface ChatState {
   generation: number;
   /** turn_end 已实时推送的中间文本轮数，agent_end 聚合时据此跳过已发送部分 */
   intermediatesSent: number;
+  /** turn_end 是否已发送最终回复（防止 agent_end 重复发送） */
+  finalSent?: boolean;
   /** 本轮出现过 LLM 错误时记录错误信息；存在即触发 agent_end 延迟收尾探针 */
   lastError?: string;
 }
@@ -424,6 +426,7 @@ export default function (pi: ExtensionAPI) {
       toolEntries: [],
       generation: gen,
       intermediatesSent: 0,
+      finalSent: false,
     });
 
     // 添加 Typing Reaction
@@ -753,6 +756,15 @@ export default function (pi: ExtensionAPI) {
       client.sendMessage(state.chatId, processed, state.userMsgId).catch((err) => {
         console.warn("[feishu] turn_end 发送中间文本失败:", err);
       });
+    } else {
+      // 最终回复（stop=stop, 无 toolCall）：直接发送，不依赖 agent_end。
+      // Pi 的429重试机制会抑制 agent_end，导致最终回复丢失。
+      const processed = downgradeHeadings(textContent);
+      state.intermediatesSent++;
+      state.finalSent = true;
+      client.sendMessage(state.chatId, processed, state.userMsgId).catch((err) => {
+        console.warn("[feishu] turn_end 发送最终回复失败:", err);
+      });
     }
 
     flashStatus(`飞书: 📤 推送中 (${textContent.length}字)`);
@@ -788,6 +800,12 @@ export default function (pi: ExtensionAPI) {
     );
     const lastMsg = event.messages?.[event.messages.length - 1] as { stopReason?: string } | undefined;
     const lastStopWasError = lastMsg?.stopReason === "error";
+
+    if (state.finalSent) {
+      // turn_end 已发送最终回复，仅清理状态
+      finalizeChatTask(state, "", false);
+      return;
+    }
 
     // 已拿到最终文本说明错误已被重试恢复：清除记录，收尾按正常完成处理（静默恢复语义），
     // 避免极端情况下误发过期错误回执
@@ -1317,6 +1335,238 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // 发送语音（语音条）
+  const SendAudioToFeishuParams = {
+    type: "object" as const,
+    properties: {
+      file_path: { type: "string" as const, description: "本地音频文件路径（wav/mp3 等）" },
+      chat_id: {
+        type: "string" as const,
+        description: "目标聊天 ID，留空则发送到最近活跃的聊天",
+      },
+    },
+    required: ["file_path"],
+  };
+
+  pi.registerTool({
+    name: "send_audio_to_feishu",
+    label: "发送语音到飞书",
+    description: "将本地音频文件转码为 opus 并以语音条形式发送到飞书（msg_type: audio）。当需要发送语音消息、语音条时使用。",
+    parameters: SendAudioToFeishuParams,
+    async execute(
+      _toolCallId: string,
+      params: Static<typeof SendAudioToFeishuParams>,
+      _signal: AbortSignal | undefined,
+      _onUpdate: any,
+      _ctx: ExtensionContext,
+    ) {
+      const filePath = params.file_path as string;
+      const chatId = (params.chat_id as string) || findActiveState()?.chatId;
+
+      if (!client || client.getStatus() !== "connected") {
+        return {
+          content: [{ type: "text" as const, text: "错误: 飞书 Bot 未连接。" }],
+          details: {} as Record<string, unknown>,
+        };
+      }
+
+      if (!chatId) {
+        return {
+          content: [{ type: "text" as const, text: "错误: 没有活跃的飞书聊天。" }],
+          details: {} as Record<string, unknown>,
+        };
+      }
+
+      if (!existsSync(filePath)) {
+        return {
+          content: [{ type: "text" as const, text: `错误: 文件不存在: ${filePath}` }],
+          details: {} as Record<string, unknown>,
+        };
+      }
+
+      try {
+        // ① 转码为 opus
+        const { execFile } = await import("node:child_process");
+        const { promisify } = await import("node:util");
+        const { tmpdir } = await import("node:os");
+        const { join } = await import("node:path");
+        const { randomBytes } = await import("node:crypto");
+        const execFileAsync = promisify(execFile);
+
+        const opusPath = join(tmpdir(), `pi-feishu-voice-${randomBytes(6).toString("hex")}.opus`);
+        await execFileAsync("ffmpeg", [
+          "-y", "-i", filePath,
+          "-c:a", "libopus", "-ac", "1", "-ar", "16000", "-b:a", "32k",
+          opusPath,
+        ]);
+
+        // ② 获取时长（毫秒）
+        const { stdout } = await execFileAsync("ffprobe", [
+          "-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", opusPath,
+        ]);
+        const durationMs = Math.round(parseFloat(stdout.trim()) * 1000);
+
+        // ③ 上传 opus 音频
+        const fileKey = await client.uploadAudio(opusPath, "voice.opus", durationMs);
+        if (!fileKey) {
+          return {
+            content: [{ type: "text" as const, text: "错误: 音频上传失败。" }],
+            details: {} as Record<string, unknown>,
+          };
+        }
+
+        // ④ 发送语音消息
+        await client.sendAudio(chatId, fileKey);
+        return {
+          content: [{ type: "text" as const, text: `语音已发送到飞书 [${chatId}]` }],
+          details: { sent: true, chatId, filePath, fileKey, durationMs } as Record<string, unknown>,
+        };
+      } catch (err) {
+        return { content: [{ type: "text" as const, text: `错误: 语音发送失败 ${err}` }], details: {} as Record<string, unknown> };
+      }
+    },
+  });
+
+  // 发送视频（视频消息 media）
+  // 调研确认（2026-08-31）：飞书官方文档 im/v1/file/create 明确规定上传文件 ≤ 30MB、图片 ≤ 10MB；
+  // 上传 mp4（file_type: mp4）后必须用 msg_type: media 发送（错误码 230055 强制类型匹配）。
+  // 30MB 上限是官方硬限制，超限无法通过 media 发送，只能压缩后发或改用文件消息。
+  const SendVideoToFeishuParams = {
+    type: "object" as const,
+    properties: {
+      file_path: { type: "string" as const, description: "本地 mp4 视频文件路径" },
+      image_path: {
+        type: "string" as const,
+        description: "可选：视频封面图片路径（jpg/png），将作为视频封面显示",
+      },
+      chat_id: {
+        type: "string" as const,
+        description: "目标聊天 ID，留空则发送到最近活跃的聊天",
+      },
+    },
+    required: ["file_path"],
+  };
+
+  pi.registerTool({
+    name: "send_video_to_feishu",
+    label: "发送视频到飞书",
+    description: "将本地视频文件上传并以视频消息形式发送到飞书（msg_type: media），可附带封面图。视频需为 mp4 格式且不超过 30MB；若编码不是 H.264（如 AV1），会自动转码为 H.264 以确保飞书正常播放。当需要发送视频、视频消息时使用。",
+    parameters: SendVideoToFeishuParams,
+    async execute(
+      _toolCallId: string,
+      params: Static<typeof SendVideoToFeishuParams>,
+      _signal: AbortSignal | undefined,
+      _onUpdate: any,
+      _ctx: ExtensionContext,
+    ) {
+      const filePath = params.file_path as string;
+      const imagePath = (params.image_path as string) || "";
+      const chatId = (params.chat_id as string) || findActiveState()?.chatId;
+
+      if (!client || client.getStatus() !== "connected") {
+        return {
+          content: [{ type: "text" as const, text: "错误: 飞书 Bot 未连接。" }],
+          details: {} as Record<string, unknown>,
+        };
+      }
+
+      if (!chatId) {
+        return {
+          content: [{ type: "text" as const, text: "错误: 没有活跃的飞书聊天。" }],
+          details: {} as Record<string, unknown>,
+        };
+      }
+
+      if (!existsSync(filePath)) {
+        return {
+          content: [{ type: "text" as const, text: `错误: 文件不存在: ${filePath}` }],
+          details: {} as Record<string, unknown>,
+        };
+      }
+
+      // 检查文件大小（飞书视频上限 30MB）
+      const { statSync } = await import("node:fs");
+      const fileSize = statSync(filePath).size;
+      if (fileSize > 30 * 1024 * 1024) {
+        return {
+          content: [{ type: "text" as const, text: `错误: 视频文件 ${(fileSize / 1024 / 1024).toFixed(1)}MB 超过飞书视频消息 30MB 上限。请压缩视频或改用发送文件方式。` }],
+          details: { sent: false, chatId, filePath, fileSize, reason: "over_30mb" } as Record<string, unknown>,
+        };
+      }
+
+      try {
+        const { basename } = await import("node:path");
+        const fileName = basename(filePath);
+        const { execFile } = await import("node:child_process");
+        const { promisify } = await import("node:util");
+        const execFileAsync = promisify(execFile);
+        const { tmpdir } = await import("node:os");
+        const { randomBytes } = await import("node:crypto");
+
+        // ① 获取视频信息：时长 + 编码
+        const [durOut, codecOut] = await Promise.all([
+          execFileAsync("ffprobe", ["-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", filePath]),
+          execFileAsync("ffprobe", ["-v", "quiet", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "csv=p=0", filePath]),
+        ]);
+        let durationMs = Math.round(parseFloat(durOut.stdout.trim()) * 1000);
+        const videoCodec = codecOut.stdout.trim();
+        // ② 编码兼容性检查：飞书播放器对 AV1 等编码支持不佳（黑屏只有声音）
+        //    非 H.264（h264/avc1）编码时自动转码为 H.264 + AAC
+        let uploadPath = filePath;
+        let transcoded = false;
+        if (videoCodec && videoCodec !== "h264") {
+          const tmpVideo = join(tmpdir(), `pi-feishu-video-${randomBytes(6).toString("hex")}.mp4`);
+          await execFileAsync("ffmpeg", [
+            "-y", "-i", filePath,
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart",
+            tmpVideo,
+          ]);
+          uploadPath = tmpVideo;
+          transcoded = true;
+
+          // 重新获取转码后时长
+          const dur2 = await execFileAsync("ffprobe", ["-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", uploadPath]);
+          const newDurationMs = Math.round(parseFloat(dur2.stdout.trim()) * 1000);
+          if (newDurationMs > 0) {
+            durationMs = newDurationMs;
+          }
+        }
+
+        // ③ 上传 mp4 视频（带时长，否则飞书显示时长 0）
+        const fileKey = await client.uploadVideo(uploadPath, fileName, durationMs);
+        if (!fileKey) {
+          return {
+            content: [{ type: "text" as const, text: "错误: 视频上传失败（请确认是 mp4 格式）。" }],
+            details: {} as Record<string, unknown>,
+          };
+        }
+
+        // ④ 可选：上传封面图
+        let imageKey: string | undefined;
+        if (imagePath) {
+          if (!existsSync(imagePath)) {
+            return {
+              content: [{ type: "text" as const, text: `错误: 封面图片不存在: ${imagePath}` }],
+              details: {} as Record<string, unknown>,
+            };
+          }
+          imageKey = (await client.uploadImage(imagePath)) ?? undefined;
+        }
+
+        // ⑤ 发送视频消息
+        await client.sendVideo(chatId, fileKey, undefined, imageKey);
+        return {
+          content: [{ type: "text" as const, text: `视频已发送到飞书 [${chatId}]${transcoded ? "（已自动转码为 H.264）" : ""}` }],
+          details: { sent: true, chatId, filePath, fileName, fileKey, imageKey, durationMs, videoCodec, transcoded } as Record<string, unknown>,
+        };
+      } catch (err) {
+        return { content: [{ type: "text" as const, text: `错误: 视频发送失败 ${err}` }], details: {} as Record<string, unknown> };
+      }
+    },
+  });
+
   // ─── 会话生命周期 ─────────────────────────────────────
 
   pi.on("session_start", async (_event, ctx) => {
@@ -1459,16 +1709,20 @@ export default function (pi: ExtensionAPI) {
 
   function extractTextFromMessage(message: any): string | null {
     if (!message?.content) return null;
-    const parts: string[] = [];
+    const textParts: string[] = [];
+    const thinkingParts: string[] = [];
     for (const block of message.content) {
       if (block.type === "text" && block.text) {
         const trimmed = block.text.trim();
-        if (trimmed) {
-          parts.push(trimmed);
-        }
+        if (trimmed) textParts.push(trimmed);
+      } else if (block.type === "thinking" && (block as any).thinking) {
+        const t = String((block as any).thinking).trim();
+        if (t) thinkingParts.push(t);
       }
     }
-    return parts.length > 0 ? parts.join("\n") : null;
+    if (textParts.length > 0) return textParts.join("\n");
+    if (thinkingParts.length > 0) return thinkingParts.join("\n");
+    return null;
   }
 
   /** 状态栏瞬态消息定时器 */

@@ -142,6 +142,8 @@ Pi LLM 可以主动调用以下工具向飞书发送内容：
 | `send_to_feishu` | 发送文本消息到飞书 |
 | `send_image_to_feishu` | 上传并发送图片到飞书 |
 | `send_file_to_feishu` | 上传并发送文件到飞书 |
+| `send_audio_to_feishu` | 转码并发送语音条到飞书（msg_type: audio） |
+| `send_video_to_feishu` | 发送视频消息到飞书（msg_type: media，可带封面，≤30MB） |
 
 ## 消息类型支持
 
@@ -162,6 +164,20 @@ Pi LLM 可以主动调用以下工具向飞书发送内容：
 | interactive | 进度卡片（可编辑更新） |
 | image | 图片消息（通过 image_key） |
 | file | 文件消息（通过 file_key） |
+| audio | 语音条消息（通过 file_key，msg_type: audio） |
+| media | 视频消息（通过 file_key，msg_type: media，可带 image_key 封面） |
+
+### 飞书媒体上传限制（官方文档确认）
+
+| 类型 | 限制 | 来源 |
+|------|------|------|
+| 文件/视频/音频 | ≤ 30MB | `im/v1/files` 文档："文件大小不得超过 30 MB，且不允许上传空文件" |
+| 图片 | ≤ 10MB | 同文档（错误码 234006：文件:30M; 图片: 10M） |
+| 类型匹配 | 上传类型必须匹配消息类型 | 错误码 230055：上传 mp4 后必须用 media 发送 |
+| 时长显示 | 上传时需传 `duration`（毫秒），否则视频/音频不显示具体时长 | `im/v1/files` 文档："不填充时无法显示具体时长" |
+| 编码兼容 | 飞书播放器对 H.264 兼容性最佳，AV1/VP9 等可能导致黑屏（只有声音） | 实测：AV1 视频播放黑屏，转码 H.264 后正常 |
+
+> 注：`im/v1/files`（IM 消息上传，30MB）与 `drive-v1`（云空间上传，20MB/分片）是不同接口，勿混淆。
 
 ## 架构
 
