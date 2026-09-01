@@ -817,8 +817,45 @@ export default function (pi: ExtensionAPI) {
     }
 
     // 出现过错误的 run：当前 agent_end 可能只是重试前的假结束。
-    // 不在此收尾、不删除状态——保留到真实最终 agent_end 收尾；看门狗兜底彻底失败。
+    // 不在此收尾、不删除状态——保留到真实最终 agent_end / agent_settled 收尾；看门狗兜底彻底失败。
     return;
+  });
+
+  // ─── agent_settled → 最终态兜底（对齐 Pi 0.84+ 官方语义）────────
+  // 区分「重试中间结束」与「真正异常」：agent_end 的 willRetry/lastError 保留策略在重试成功时由下一轮 agent_end 收尾；
+  // 重试耗尽或不可重试异常则无后续 agent_end，需靠 agent_settled 立即回执并放行队列，避免依赖 5 分钟看门狗。
+  pi.on("agent_settled" as any, () => {
+    if (!client || client.getStatus() !== "connected") return;
+    const state = findActiveState();
+    if (!state) return;
+    if (state.generation !== chatGeneration.get(state.chatId)) return;
+    if (!isCtxIdle()) return;
+    // 若 turn_end 已直发最终回复，agent_end 已走 finalSent 清理，此处 state 可能已删除，直接返回
+    if (!chatStates.has(state.chatId)) return;
+
+    // 仍有残留状态说明 agent_end 早退未收尾（lastError 保留或异常中断）
+    if (state.lastError) {
+      client.sendMessage(state.chatId, `LLM 错误: ${state.lastError.slice(0, 200)}`, state.userMsgId).catch(() => {});
+    } else {
+      // 无错误也无文本的异常中断，给出通用提示避免静默
+      const hasPending = globalQueue.items.length > 0;
+      if (!hasPending) {
+        // 无排队且无错误，说明可能已通过 turn_end 发送，无需额外提示
+        // 仅做状态清理
+      }
+    }
+    client.stopTyping(state.chatId, false).catch(() => {});
+    const watchdog = taskWatchdogTimers.get(state.chatId);
+    if (watchdog) {
+      clearTimeout(watchdog);
+      taskWatchdogTimers.delete(state.chatId);
+    }
+    watchdogExtensionCounts.delete(state.chatId);
+    chatStates.delete(state.chatId);
+    chatGeneration.set(state.chatId, (chatGeneration.get(state.chatId) ?? 0) + 1);
+    globalQueue.processing = false;
+    flushAllQueues();
+    flashStatus("飞书: ⚠️ 已清理异常状态");
   });
 
   /** 收尾：推送最终文本或错误回执 + 清理桥接状态、看门狗 + 放行排队消息 */
