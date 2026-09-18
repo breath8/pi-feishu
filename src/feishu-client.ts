@@ -9,7 +9,7 @@
  */
 
 import * as Lark from "@larksuiteoapi/node-sdk";
-import { writeFileSync, mkdirSync, existsSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import { writeFileSync, appendFileSync, mkdirSync, existsSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { FeishuConfig, BridgeStatus } from "./types.js";
@@ -23,6 +23,39 @@ function _log(...args: unknown[]): void {
 function _warn(...args: unknown[]): void {
   console.warn("[FeishuClient]", ...args);
 }
+
+/**
+ * 重定向 Lark SDK 日志到文件，避开 Pi 的 TUI。
+ *
+ * SDK 的 defaultLogger 直接用 console.info/console.log 写 **stdout**，而 Pi 的 TUI
+ * 独占 stdout：启动阶段 WS 握手日志（client ready / event-dispatch is ready /
+ * ws client ready）会在界面首次渲染之后落到终端，扰乱 TUI 行计算，
+ * 导致编辑框上方出现重复的状态行（tps / 状态行 / 飞书 / 状态行）。
+ *
+ * 注意：也不能改写 stderr。交互式 Pi 的 stderr 与 stdout 指向同一个 tty，
+ * 写入同样会被 TUI 当作画面内容（实测仍会复现重复行）。
+ * 因此统一落盘到临时目录，保留 info 级别诊断能力而不碰终端。
+ */
+const LARK_LOG_PATH = join(tmpdir(), "pi-feishu-lark.log");
+
+function _larkLog(level: string, msg: unknown[]): void {
+  try {
+    const line = `[${new Date().toISOString()}] [${level}] ${msg
+      .map((m) => (typeof m === "string" ? m : (() => { try { return JSON.stringify(m); } catch { return String(m); } })()))
+      .join(" ")}\n`;
+    appendFileSync(LARK_LOG_PATH, line);
+  } catch {
+    /* 日志失败不得影响连接 */
+  }
+}
+
+const larkLogger: Lark.Logger = {
+  error: (...msg: unknown[]) => _larkLog("error", msg),
+  warn: (...msg: unknown[]) => _larkLog("warn", msg),
+  info: (...msg: unknown[]) => _larkLog("info", msg),
+  debug: (...msg: unknown[]) => _larkLog("debug", msg),
+  trace: (...msg: unknown[]) => _larkLog("trace", msg),
+};
 
 // ─── 常量 ─────────────────────────────────────────────
 
@@ -129,6 +162,8 @@ export class FeishuClient {
       appSecret: config.appSecret,
       appType: Lark.AppType.SelfBuild,
       domain,
+      // 同上：不传 logger 会回退到写 stdout 的 defaultLogger
+      logger: larkLogger,
     });
 
     // 确保临时目录存在
@@ -172,6 +207,8 @@ export class FeishuClient {
       const dispatcher = new Lark.EventDispatcher({
         encryptKey: this.config.encryptKey ?? "",
         verificationToken: this.config.verificationToken ?? "",
+        // 同上：不传 logger 会回退到写 stdout 的 defaultLogger
+        logger: larkLogger,
       });
 
       dispatcher.register({
@@ -198,6 +235,8 @@ export class FeishuClient {
         appSecret: this.config.appSecret,
         domain,
         loggerLevel: Lark.LoggerLevel.info,
+        // 见 larkLogger：SDK 默认 logger 写 stdout 会污染 Pi 的 TUI
+        logger: larkLogger,
         autoReconnect: true,
         handshakeTimeoutMs: 15000,
         wsConfig: {

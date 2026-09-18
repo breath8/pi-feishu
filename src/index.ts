@@ -1608,7 +1608,11 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     ctxRef = ctx;
-    updateStatus(ctx, client?.getStatus() ?? "disconnected");
+    // 首次启动时 client 尚未创建：不要先渲染「未连接」再被 connecting 清空，
+    // 否则启动瞬间会多出一行抖动。已有实例时才同步当前状态。
+    if (client) {
+      updateStatus(ctx, client.getStatus());
+    }
 
     // 绝不阻塞核心的会话启动链路：此前 await 重连导致 newSession 悬挂，
     // 飞书侧永远停在「正在切换到全新会话…」。仅在连接确实失效时后台重启。
@@ -1766,6 +1770,17 @@ export default function (pi: ExtensionAPI) {
   let statusTimer: ReturnType<typeof setTimeout> | null = null;
   let currentStatusText: string = "";
 
+  /**
+   * 提升为 powerline 独立行的标记前缀。
+   * pi-powerline-footer 会把以 "[" 开头的 status 从聚合的 extension_statuses
+   * 段中移出，渲染成编辑框上方单独一行，并在显示前剥掉该前缀。
+   * pi 原生 footer 不认识这个标记，只会原样显示，无害。
+   *
+   * 仅用于稳定态与 flashStatus。连接生命周期中的 connecting 瞬态不走提升通道，
+   * 避免启动时「连接中 → 已连接」先后占用两行、挤压 powerline 状态行。
+   */
+  const NOTIFICATION_MARKER = "[";
+
   function updateStatus(ctx: ExtensionContext | null, status: string): void {
     let hasUI = false;
     try {
@@ -1788,10 +1803,24 @@ export default function (pi: ExtensionAPI) {
     };
 
     const text = statusMap[status] ?? `飞书: ${status}`;
+
+    // connecting 是启动/重连瞬态：不占用独立行。
+    // 否则启动时会先后渲染「连接中」与「已连接」两行，把 powerline 状态行挤下去。
+    // 稳定态（connected/error/disconnected）才提升为独立行，与 pi-token-speed 的 TPS 行一致。
+    if (status === "connecting") {
+      currentStatusText = "";
+      try {
+        ctx?.ui.setStatus("feishu", undefined);
+      } catch {}
+      return;
+    }
+
     if (currentStatusText === text) return;
     currentStatusText = text;
     try {
-      ctx?.ui.setStatus("feishu", text);
+      // 提升标记：pi-powerline-footer 会把以 "[" 开头的 status 渲染为编辑框上方独立一行，
+      // 与 pi-token-speed 的 TPS 行同一机制。pi 原生 footer 不认识该标记，只会原样显示，无害。
+      ctx?.ui.setStatus("feishu", `${NOTIFICATION_MARKER}${text}`);
     } catch {}
   }
 
@@ -1808,7 +1837,7 @@ export default function (pi: ExtensionAPI) {
     if (currentStatusText === message) return;
     currentStatusText = message;
     try {
-      ctxRef!.ui.setStatus("feishu", message);
+      ctxRef!.ui.setStatus("feishu", `${NOTIFICATION_MARKER}${message}`);
     } catch {}
 
     statusTimer = setTimeout(() => {
@@ -1818,7 +1847,8 @@ export default function (pi: ExtensionAPI) {
         if (currentStatusText !== text) {
           currentStatusText = text;
           try {
-            ctxRef?.ui.setStatus("feishu", text);
+            // 瞬态提示结束后回落到独立状态行（与 TPS 行一致）
+            ctxRef?.ui.setStatus("feishu", `${NOTIFICATION_MARKER}${text}`);
           } catch {}
         }
       }
